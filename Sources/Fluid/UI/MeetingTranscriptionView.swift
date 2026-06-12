@@ -5,6 +5,7 @@ struct MeetingTranscriptionView: View {
     let asrService: ASRService
     @StateObject private var transcriptionService: MeetingTranscriptionService
     @ObservedObject private var fileHistoryStore = FileTranscriptionHistoryStore.shared
+    @ObservedObject private var settings = SettingsStore.shared
     @State private var selectedFileURL: URL?
     @Environment(\.theme) private var theme
 
@@ -164,6 +165,51 @@ struct MeetingTranscriptionView: View {
                         )
                 )
 
+                // Speaker labeling options (unavailable on Intel Macs)
+                if SpeakerDiarizationService.isSupported {
+                    VStack(spacing: 10) {
+                        Toggle(isOn: self.$settings.fileTranscriptionSpeakerLabelsEnabled) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Label speakers")
+                                    .font(.subheadline)
+
+                                Text("Identify who said what (downloads speaker models on first use)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
+
+                        if self.settings.fileTranscriptionSpeakerLabelsEnabled {
+                            HStack {
+                                Text("Number of speakers")
+                                    .font(.subheadline)
+
+                                Spacer()
+
+                                Picker("", selection: self.$settings.fileTranscriptionExpectedSpeakerCount) {
+                                    Text("Auto").tag(0)
+                                    ForEach(2 ... 8, id: \.self) { count in
+                                        Text("\(count)").tag(count)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .labelsHidden()
+                                .frame(width: 90)
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(self.theme.palette.cardBackground)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(self.theme.palette.cardBorder.opacity(0.5), lineWidth: 1)
+                            )
+                    )
+                }
+
                 // Transcribe Button
                 Button(action: {
                     Task {
@@ -312,11 +358,36 @@ struct MeetingTranscriptionView: View {
 
             // Transcription text
             ScrollView {
-                Text(result.text)
-                    .font(.body)
-                    .textSelection(.enabled)
+                if !result.speakerSegments.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(result.speakerSegments) { segment in
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(segment.speaker)
+                                        .font(.caption)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(Color.fluidGreen)
+
+                                    Text(Self.timestampString(segment.startSeconds))
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Text(segment.text)
+                                    .font(.body)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
+                } else {
+                    Text(result.text)
+                        .font(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
             }
             .frame(maxHeight: 300)
             .background(
@@ -585,6 +656,18 @@ struct MeetingTranscriptionView: View {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: fileSize)
+    }
+
+    /// Format seconds as m:ss (or h:mm:ss for long files) for speaker segment timestamps.
+    private static func timestampString(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded(.down))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%d:%02d", minutes, secs)
     }
 
     private func copyToClipboard(_ text: String) {

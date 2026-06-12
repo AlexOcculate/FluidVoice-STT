@@ -1374,6 +1374,24 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Label speakers ("Speaker 1", "Speaker 2") in file transcriptions (default: OFF).
+    var fileTranscriptionSpeakerLabelsEnabled: Bool {
+        get { self.defaults.bool(forKey: Keys.fileTranscriptionSpeakerLabelsEnabled) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.fileTranscriptionSpeakerLabelsEnabled)
+        }
+    }
+
+    /// Expected speaker count hint for file transcription diarization. 0 = auto-detect.
+    var fileTranscriptionExpectedSpeakerCount: Int {
+        get { self.defaults.integer(forKey: Keys.fileTranscriptionExpectedSpeakerCount) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.fileTranscriptionExpectedSpeakerCount)
+        }
+    }
+
     /// Anonymous analytics toggle (default: ON). Uses default-true semantics so existing installs
     /// upgrading to a version that includes analytics do not silently default to OFF.
     var shareAnonymousAnalytics: Bool {
@@ -4877,6 +4895,8 @@ private extension SettingsStore {
     enum Keys {
         static let enableAIProcessing = "EnableAIProcessing"
         static let showMainWindowAtLoginLaunch = "ShowMainWindowAtLoginLaunch"
+        static let fileTranscriptionSpeakerLabelsEnabled = "FileTranscriptionSpeakerLabelsEnabled"
+        static let fileTranscriptionExpectedSpeakerCount = "FileTranscriptionExpectedSpeakerCount"
         static let dictationPromptOff = "DictationPromptOff"
         static let enableDebugLogs = "EnableDebugLogs"
         static let availableAIModels = "AvailableAIModels"

@@ -4,6 +4,20 @@ import CoreMedia
 import Foundation
 import UniformTypeIdentifiers
 
+/// One speaker-attributed portion of a file transcription.
+struct SpeakerTranscriptSegment: Identifiable, Sendable, Codable, Equatable {
+    let speaker: String
+    let startSeconds: Double
+    let endSeconds: Double
+    let text: String
+
+    var id: String { "\(self.speaker)-\(self.startSeconds)" }
+
+    enum CodingKeys: String, CodingKey {
+        case speaker, startSeconds, endSeconds, text
+    }
+}
+
 /// Result of a transcription operation
 struct TranscriptionResult: Identifiable, Sendable, Codable {
     let id: UUID
@@ -13,6 +27,8 @@ struct TranscriptionResult: Identifiable, Sendable, Codable {
     let processingTime: TimeInterval
     let fileName: String
     let timestamp: Date
+    /// Speaker-attributed segments when diarization was enabled; empty otherwise.
+    let speakerSegments: [SpeakerTranscriptSegment]
 
     init(
         id: UUID = UUID(),
@@ -21,7 +37,8 @@ struct TranscriptionResult: Identifiable, Sendable, Codable {
         duration: TimeInterval,
         processingTime: TimeInterval,
         fileName: String,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        speakerSegments: [SpeakerTranscriptSegment] = []
     ) {
         self.id = id
         self.text = text
@@ -30,10 +47,11 @@ struct TranscriptionResult: Identifiable, Sendable, Codable {
         self.processingTime = processingTime
         self.fileName = fileName
         self.timestamp = timestamp
+        self.speakerSegments = speakerSegments
     }
 
     enum CodingKeys: String, CodingKey {
-        case text, confidence, duration, processingTime, fileName, timestamp
+        case text, confidence, duration, processingTime, fileName, timestamp, speakerSegments
     }
 
     init(from decoder: Decoder) throws {
@@ -45,6 +63,7 @@ struct TranscriptionResult: Identifiable, Sendable, Codable {
         self.processingTime = try c.decode(TimeInterval.self, forKey: .processingTime)
         self.fileName = try c.decode(String.self, forKey: .fileName)
         self.timestamp = try c.decode(Date.self, forKey: .timestamp)
+        self.speakerSegments = try c.decodeIfPresent([SpeakerTranscriptSegment].self, forKey: .speakerSegments) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -55,6 +74,9 @@ struct TranscriptionResult: Identifiable, Sendable, Codable {
         try c.encode(self.processingTime, forKey: .processingTime)
         try c.encode(self.fileName, forKey: .fileName)
         try c.encode(self.timestamp, forKey: .timestamp)
+        if !self.speakerSegments.isEmpty {
+            try c.encode(self.speakerSegments, forKey: .speakerSegments)
+        }
     }
 }
 
@@ -206,6 +228,23 @@ final class MeetingTranscriptionService: ObservableObject {
 
             let isVideoContainer = UTType(filenameExtension: fileExtension)
                 .map { $0.conforms(to: .movie) } ?? false
+
+            // Speaker-labeled path: diarize first, then transcribe each speaker turn.
+            // Any diarization failure falls back to the standard paths below.
+            if SettingsStore.shared.fileTranscriptionSpeakerLabelsEnabled, SpeakerDiarizationService.isSupported {
+                if let labeledResult = await self.transcribeFileWithSpeakerLabels(
+                    fileURL,
+                    provider: provider,
+                    duration: duration,
+                    startTime: startTime
+                ) {
+                    return labeledResult
+                }
+                DebugLogger.shared.warning(
+                    "Speaker labeling unavailable for this file; falling back to standard transcription",
+                    source: "MeetingTranscriptionService"
+                )
+            }
 
             if provider.prefersNativeFileTranscription && !isVideoContainer {
                 self.currentStatus = duration > 0 ? "Transcribing audio (\(Int(duration))s)..." : "Transcribing audio..."
@@ -432,5 +471,282 @@ final class MeetingTranscriptionService: ObservableObject {
         self.error = nil
         self.currentStatus = ""
         self.progress = 0.0
+    }
+
+    // MARK: - Speaker-Labeled Transcription
+
+    /// Diarize-first pipeline: identify speaker turns, then transcribe the audio slice for
+    /// each turn with the active provider. Returns nil when diarization fails or yields
+    /// nothing usable, so the caller can fall back to the standard transcription paths.
+    private func transcribeFileWithSpeakerLabels(
+        _ fileURL: URL,
+        provider: TranscriptionProvider,
+        duration: Double,
+        startTime: Date
+    ) async -> TranscriptionResult? {
+        self.currentStatus = "Identifying speakers..."
+        self.progress = 0.25
+
+        let expectedSpeakers = SettingsStore.shared.fileTranscriptionExpectedSpeakerCount
+        let diarizer = SpeakerDiarizationService(
+            expectedSpeakers: expectedSpeakers > 0 ? expectedSpeakers : nil
+        )
+
+        let turns: [SpeakerDiarizationService.SpeakerTurn]
+        do {
+            turns = try await diarizer.diarize(fileURL: fileURL)
+        } catch {
+            DebugLogger.shared.warning(
+                "Diarization failed: \(error.localizedDescription)",
+                source: "MeetingTranscriptionService"
+            )
+            return nil
+        }
+
+        guard !turns.isEmpty else {
+            DebugLogger.shared.info(
+                "Diarization found no speaker turns",
+                source: "MeetingTranscriptionService"
+            )
+            return nil
+        }
+
+        let audioFile: AVAudioFile
+        do {
+            audioFile = try AVAudioFile(forReading: fileURL)
+        } catch {
+            DebugLogger.shared.warning(
+                "Could not open audio for speaker slicing: \(error.localizedDescription)",
+                source: "MeetingTranscriptionService"
+            )
+            return nil
+        }
+
+        var segments: [SpeakerTranscriptSegment] = []
+        var totalConfidence: Float = 0
+
+        for (index, turn) in turns.enumerated() {
+            self.currentStatus = "Transcribing speaker segments (\(index + 1)/\(turns.count))..."
+            self.progress = 0.3 + (Double(index) / Double(turns.count)) * 0.65
+
+            let samples: [Float]
+            do {
+                samples = try self.readSamples(
+                    from: audioFile,
+                    startSeconds: turn.startSeconds,
+                    endSeconds: turn.endSeconds,
+                    minimumDurationSeconds: 1.1
+                )
+            } catch {
+                DebugLogger.shared.warning(
+                    "Skipping speaker segment at \(String(format: "%.1f", turn.startSeconds))s: \(error.localizedDescription)",
+                    source: "MeetingTranscriptionService"
+                )
+                continue
+            }
+
+            // Mirror the standard path's 1-second ASR minimum
+            guard samples.count >= 16_000 else { continue }
+
+            let chunkResult: ASRTranscriptionResult
+            do {
+                chunkResult = try await provider.transcribe(samples)
+            } catch {
+                DebugLogger.shared.warning(
+                    "Transcription failed for speaker segment at \(String(format: "%.1f", turn.startSeconds))s: \(error.localizedDescription)",
+                    source: "MeetingTranscriptionService"
+                )
+                continue
+            }
+
+            let text = chunkResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+
+            segments.append(SpeakerTranscriptSegment(
+                speaker: turn.speakerLabel,
+                startSeconds: turn.startSeconds,
+                endSeconds: turn.endSeconds,
+                text: text
+            ))
+            totalConfidence += chunkResult.confidence
+        }
+
+        guard !segments.isEmpty else {
+            DebugLogger.shared.warning(
+                "No speaker segments produced text",
+                source: "MeetingTranscriptionService"
+            )
+            return nil
+        }
+
+        let labeledText = segments
+            .map { "\($0.speaker): \($0.text)" }
+            .joined(separator: "\n\n")
+        let avgConfidence = totalConfidence / Float(segments.count)
+        let processingTime = Date().timeIntervalSince(startTime)
+
+        let result = TranscriptionResult(
+            text: labeledText,
+            confidence: avgConfidence,
+            duration: duration,
+            processingTime: processingTime,
+            fileName: fileURL.lastPathComponent,
+            speakerSegments: segments
+        )
+
+        self.currentStatus = "Complete!"
+        self.progress = 1.0
+
+        AnalyticsService.shared.capture(
+            .meetingTranscriptionCompleted,
+            properties: [
+                "success": true,
+                "file_type": fileURL.pathExtension.lowercased(),
+                "audio_duration_bucket": AnalyticsBuckets.bucketSeconds(duration),
+                "processing_time_bucket": AnalyticsBuckets.bucketSeconds(processingTime),
+                "speaker_labels": true,
+                "speaker_count": Set(segments.map(\.speaker)).count,
+            ]
+        )
+
+        self.result = result
+        FileTranscriptionHistoryStore.shared.addEntry(result)
+        return result
+    }
+
+    /// Read a time range from an audio file as 16kHz mono Float32 samples.
+    /// Short ranges are widened symmetrically to `minimumDurationSeconds` (clamped to
+    /// the file bounds) so very brief speaker turns still meet the ASR input minimum.
+    private nonisolated func readSamples(
+        from audioFile: AVAudioFile,
+        startSeconds: Double,
+        endSeconds: Double,
+        minimumDurationSeconds: Double
+    ) throws -> [Float] {
+        let sourceSampleRate = audioFile.processingFormat.sampleRate
+        guard sourceSampleRate > 0 else {
+            throw TranscriptionError.audioConversionFailed("Invalid audio file: sample rate is 0")
+        }
+        let fileDurationSeconds = Double(audioFile.length) / sourceSampleRate
+
+        var start = max(0, startSeconds)
+        var end = min(endSeconds, fileDurationSeconds)
+        if end - start < minimumDurationSeconds {
+            let deficit = minimumDurationSeconds - (end - start)
+            start = max(0, start - deficit / 2)
+            end = min(fileDurationSeconds, start + minimumDurationSeconds)
+            start = max(0, end - minimumDurationSeconds)
+        }
+        guard end > start else { return [] }
+
+        let startFrame = AVAudioFramePosition((start * sourceSampleRate).rounded(.down))
+        let frameCount = AVAudioFrameCount(((end - start) * sourceSampleRate).rounded(.up))
+        guard frameCount > 0 else { return [] }
+
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: audioFile.processingFormat,
+            frameCapacity: frameCount
+        ) else {
+            throw TranscriptionError.audioConversionFailed("Could not create audio buffer")
+        }
+
+        audioFile.framePosition = startFrame
+        try audioFile.read(into: buffer, frameCount: frameCount)
+        return try self.resampleBuffer(buffer)
+    }
+
+    // MARK: - Audio Resampling Helpers
+
+    /// Resample an audio buffer to 16kHz mono Float32 samples
+    /// - Parameters:
+    ///   - buffer: Source audio buffer
+    ///   - targetSampleRate: Target sample rate (default 16000 Hz)
+    /// - Returns: Array of Float32 samples at target sample rate
+    private nonisolated func resampleBuffer(_ buffer: AVAudioPCMBuffer, targetSampleRate: Double = 16_000) throws -> [Float] {
+        let sourceFormat = buffer.format
+        let sourceSampleRate = sourceFormat.sampleRate
+        let sourceChannels = sourceFormat.channelCount
+
+        // Create target format (16kHz mono Float32)
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: targetSampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw NSError(
+                domain: "MeetingTranscriptionService",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create target audio format"]
+            )
+        }
+
+        // If already in correct format, just extract samples
+        // Must also verify the format is Float32 - if source is Float64, floatChannelData returns nil
+        if sourceSampleRate == targetSampleRate,
+           sourceChannels == 1,
+           sourceFormat.commonFormat == .pcmFormatFloat32
+        {
+            guard let channelData = buffer.floatChannelData else {
+                throw NSError(
+                    domain: "MeetingTranscriptionService",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not access audio channel data"]
+                )
+            }
+            let frameLength = Int(buffer.frameLength)
+            return Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
+        }
+
+        // Create converter
+        guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            throw NSError(
+                domain: "MeetingTranscriptionService",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create audio converter"]
+            )
+        }
+
+        // Calculate output buffer size
+        let ratio = targetSampleRate / sourceSampleRate
+        let estimatedFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
+
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: estimatedFrameCount + 1024) else {
+            throw NSError(
+                domain: "MeetingTranscriptionService",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create output buffer"]
+            )
+        }
+
+        // Convert
+        var error: NSError?
+        var inputConsumed = false
+
+        converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            if inputConsumed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            inputConsumed = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+
+        if let error = error {
+            throw error
+        }
+
+        // Extract samples
+        guard let channelData = outputBuffer.floatChannelData else {
+            throw NSError(
+                domain: "MeetingTranscriptionService",
+                code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "Could not access converted audio data"]
+            )
+        }
+
+        let frameLength = Int(outputBuffer.frameLength)
+        return Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
     }
 }
