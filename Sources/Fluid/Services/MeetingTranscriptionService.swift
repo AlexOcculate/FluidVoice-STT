@@ -529,46 +529,31 @@ final class MeetingTranscriptionService: ObservableObject {
             self.currentStatus = "Transcribing speaker segments (\(index + 1)/\(turns.count))..."
             self.progress = 0.3 + (Double(index) / Double(turns.count)) * 0.65
 
-            let samples: [Float]
+            let transcribed: (text: String, confidence: Float)?
             do {
-                samples = try self.readSamples(
-                    from: audioFile,
-                    startSeconds: turn.startSeconds,
-                    endSeconds: turn.endSeconds,
-                    minimumDurationSeconds: 1.1
-                )
+                transcribed = try await self.transcribeSpeakerTurn(turn, from: audioFile, provider: provider)
             } catch {
+                // A genuine audio-read or ASR failure would drop this turn's time range,
+                // leaving a silent gap in the labeled transcript. Abandon the labeled path
+                // so the caller re-transcribes the whole file — baseline behavior is never
+                // at risk (a complete unlabeled transcript beats a labeled one with holes).
                 DebugLogger.shared.warning(
-                    "Skipping speaker segment at \(String(format: "%.1f", turn.startSeconds))s: \(error.localizedDescription)",
+                    "Speaker labeling aborted at segment \(index + 1)/\(turns.count) (\(String(format: "%.1f", turn.startSeconds))s): \(error.localizedDescription); falling back to standard transcription",
                     source: "MeetingTranscriptionService"
                 )
-                continue
+                return nil
             }
 
-            // Mirror the standard path's 1-second ASR minimum
-            guard samples.count >= 16_000 else { continue }
-
-            let chunkResult: ASRTranscriptionResult
-            do {
-                chunkResult = try await provider.transcribe(samples)
-            } catch {
-                DebugLogger.shared.warning(
-                    "Transcription failed for speaker segment at \(String(format: "%.1f", turn.startSeconds))s: \(error.localizedDescription)",
-                    source: "MeetingTranscriptionService"
-                )
-                continue
-            }
-
-            let text = chunkResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            // No usable audio in this turn (too short or silent) — skip without losing content.
+            guard let transcribed else { continue }
 
             segments.append(SpeakerTranscriptSegment(
                 speaker: turn.speakerLabel,
                 startSeconds: turn.startSeconds,
                 endSeconds: turn.endSeconds,
-                text: text
+                text: transcribed.text
             ))
-            totalConfidence += chunkResult.confidence
+            totalConfidence += transcribed.confidence
         }
 
         guard !segments.isEmpty else {
@@ -612,6 +597,59 @@ final class MeetingTranscriptionService: ObservableObject {
         self.result = result
         FileTranscriptionHistoryStore.shared.addEntry(result)
         return result
+    }
+
+    /// Transcribe a single speaker turn, splitting overlong turns into model-sized chunks so a
+    /// long single-speaker stretch never exceeds the ASR input limit (mirrors the standard
+    /// path's 20-minute chunking). Returns the concatenated text and mean confidence, or nil
+    /// when the turn holds no usable audio (too short or silent). Throws on a genuine audio-read
+    /// or ASR failure so the caller can fall back to full-file transcription rather than emit a
+    /// transcript with silent gaps.
+    private func transcribeSpeakerTurn(
+        _ turn: SpeakerDiarizationService.SpeakerTurn,
+        from audioFile: AVAudioFile,
+        provider: TranscriptionProvider
+    ) async throws -> (text: String, confidence: Float)? {
+        // Keep each ASR request well under the model's input limit, matching the standard path.
+        let maxChunkSeconds: Double = 20 * 60
+
+        var ranges: [(start: Double, end: Double)] = []
+        if turn.endSeconds - turn.startSeconds > maxChunkSeconds {
+            var chunkStart = turn.startSeconds
+            while chunkStart < turn.endSeconds {
+                let chunkEnd = min(chunkStart + maxChunkSeconds, turn.endSeconds)
+                ranges.append((chunkStart, chunkEnd))
+                chunkStart = chunkEnd
+            }
+        } else {
+            ranges.append((turn.startSeconds, turn.endSeconds))
+        }
+
+        var pieces: [String] = []
+        var confidenceSum: Float = 0
+        var transcribedChunks = 0
+
+        for range in ranges {
+            let samples = try self.readSamples(
+                from: audioFile,
+                startSeconds: range.start,
+                endSeconds: range.end,
+                minimumDurationSeconds: 1.1
+            )
+            // Mirror the standard path's 1-second ASR minimum.
+            guard samples.count >= 16_000 else { continue }
+
+            let chunkResult = try await provider.transcribe(samples)
+            let text = chunkResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+
+            pieces.append(text)
+            confidenceSum += chunkResult.confidence
+            transcribedChunks += 1
+        }
+
+        guard transcribedChunks > 0 else { return nil }
+        return (pieces.joined(separator: " "), confidenceSum / Float(transcribedChunks))
     }
 
     /// Read a time range from an audio file as 16kHz mono Float32 samples.

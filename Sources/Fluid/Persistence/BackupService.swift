@@ -102,6 +102,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let editPromptRoutingScope: SettingsStore.PromptRoutingScope?
     let defaultDictationPromptOverride: String?
     let defaultEditPromptOverride: String?
+    let fileTranscriptionSpeakerLabelsEnabled: Bool?
+    let fileTranscriptionExpectedSpeakerCount: Int?
 }
 
 struct AppBackupDocument: Codable, Equatable {
