@@ -653,8 +653,9 @@ final class MeetingTranscriptionService: ObservableObject {
     }
 
     /// Read a time range from an audio file as 16kHz mono Float32 samples.
-    /// Short ranges are widened symmetrically to `minimumDurationSeconds` (clamped to
-    /// the file bounds) so very brief speaker turns still meet the ASR input minimum.
+    /// Ranges shorter than `minimumDurationSeconds` are padded with trailing silence
+    /// (never widened into neighboring audio) so very brief speaker turns meet the ASR
+    /// input minimum without absorbing an adjacent speaker's words.
     private nonisolated func readSamples(
         from audioFile: AVAudioFile,
         startSeconds: Double,
@@ -667,14 +668,8 @@ final class MeetingTranscriptionService: ObservableObject {
         }
         let fileDurationSeconds = Double(audioFile.length) / sourceSampleRate
 
-        var start = max(0, startSeconds)
-        var end = min(endSeconds, fileDurationSeconds)
-        if end - start < minimumDurationSeconds {
-            let deficit = minimumDurationSeconds - (end - start)
-            start = max(0, start - deficit / 2)
-            end = min(fileDurationSeconds, start + minimumDurationSeconds)
-            start = max(0, end - minimumDurationSeconds)
-        }
+        let start = max(0, startSeconds)
+        let end = min(endSeconds, fileDurationSeconds)
         guard end > start else { return [] }
 
         let startFrame = AVAudioFramePosition((start * sourceSampleRate).rounded(.down))
@@ -690,7 +685,16 @@ final class MeetingTranscriptionService: ObservableObject {
 
         audioFile.framePosition = startFrame
         try audioFile.read(into: buffer, frameCount: frameCount)
-        return try self.resampleBuffer(buffer)
+        var samples = try self.resampleBuffer(buffer)
+
+        // Pad short turns with trailing silence (at the 16kHz ASR rate) rather than widening
+        // the window into adjacent turns — absorbing a neighbor's audio would attribute their
+        // words to this speaker. Trailing silence keeps the segment single-speaker.
+        let minimumSamples = Int((minimumDurationSeconds * 16_000).rounded(.up))
+        if samples.count < minimumSamples {
+            samples.append(contentsOf: repeatElement(Float(0), count: minimumSamples - samples.count))
+        }
+        return samples
     }
 
     // MARK: - Audio Resampling Helpers
