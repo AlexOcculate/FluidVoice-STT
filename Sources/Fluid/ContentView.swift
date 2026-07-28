@@ -3041,10 +3041,16 @@ struct ContentView: View {
             "ContentView: startRecording() for model=\(model.displayName), supportsStreaming=\(model.supportsStreaming)",
             source: "ContentView"
         )
+        guard !self.asr.isRunningOrStarting else {
+            DebugLogger.shared.debug("ContentView: start ignored because capture is already active", source: "ContentView")
+            return
+        }
 
         self.advanceOverlayLifecycle()
         self.setActiveRecordingMode(.dictate)
-        let shouldShowDictationOverlay = !self.isRecordingForCommand && !self.isRecordingForRewrite
+        let shouldShowDictationOverlay = !self.isRecordingForCommand
+            && !self.isRecordingForRewrite
+            && self.asr.micStatus == .authorized
         let shouldPlayStartSound = !self.isRecordingForCommand
             && !self.isRecordingForRewrite
             && self.asr.micStatus == .authorized
@@ -3052,20 +3058,18 @@ struct ContentView: View {
         // Ensure normal dictation mode is set (command/rewrite modes set their own)
         if shouldShowDictationOverlay {
             self.menuBarManager.setOverlayMode(.dictation)
+            self.menuBarManager.showRecordingOverlayImmediately()
         }
 
         Task {
             if shouldPlayStartSound, !self.asr.isRunning {
                 TranscriptionSoundPlayer.shared.playStartSound()
             }
-            await self.asr.start(onCaptureStarted: {
+            let startOutcome = await self.asr.start(onCaptureStarted: {
                 self.captureRecordingContext()
                 self.prewarmPrivateAIDictationIfNeeded(for: .primary)
-                if shouldShowDictationOverlay {
-                    self.menuBarManager.showRecordingOverlayImmediately()
-                }
             })
-            if !self.asr.isRunning {
+            if startOutcome == .failed {
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
             }
         }
@@ -3457,7 +3461,7 @@ struct ContentView: View {
             handled = true
         }
 
-        if self.asr.isRunning {
+        if self.asr.isRunningOrStarting {
             DebugLogger.shared.debug("Cancel shortcut: cancelling ASR recording", source: "ContentView")
             Task { await self.asr.stopWithoutTranscription() }
             self.cancelPrewarmDictationIfNeeded()
@@ -3672,26 +3676,28 @@ extension ContentView {
         self.setActiveRecordingMode(mode)
         self.rewriteModeService.clearState()
 
-        guard !self.asr.isRunning else {
-            self.appBench("asr_start_skipped reason=already_running")
+        guard !self.asr.isRunningOrStarting else {
+            self.appBench("asr_start_skipped reason=already_running_or_starting")
             return
         }
         self.advanceOverlayLifecycle()
+        if self.asr.micStatus == .authorized {
+            self.appBench("overlay_mode_request mode=Dictation")
+            self.menuBarManager.setOverlayMode(.dictation)
+            self.menuBarManager.showRecordingOverlayImmediately()
+            self.appBench("overlay_mode_requested mode=Dictation")
+        }
         Task {
             let asrStartStartedAt = ProcessInfo.processInfo.systemUptime
             DebugLogger.shared.benchmark("APP_BENCH", message: "asr_start_call", source: "AppBenchmark")
             if SettingsStore.shared.enableTranscriptionSounds, !self.asr.isRunning {
                 TranscriptionSoundPlayer.shared.playStartSound()
             }
-            await self.asr.start(onCaptureStarted: {
+            let startOutcome = await self.asr.start(onCaptureStarted: {
                 self.captureRecordingContext()
-                self.appBench("overlay_mode_request mode=Dictation")
-                self.menuBarManager.setOverlayMode(.dictation)
-                self.menuBarManager.showRecordingOverlayImmediately()
-                self.appBench("overlay_mode_requested mode=Dictation")
                 self.prewarmPrivateAIDictationIfNeeded(for: slot)
             })
-            if !self.asr.isRunning {
+            if startOutcome == .failed {
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
             }
             DebugLogger.shared.benchmark(

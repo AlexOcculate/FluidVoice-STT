@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreAudio
 @testable import FluidVoice_Debug
 import Foundation
@@ -12,6 +13,42 @@ final class HotkeyShortcutTests: XCTestCase {
     private let microphoneSelectionModeKey = "MicrophoneSelectionMode"
     private let preferredInputDeviceUIDKey = "PreferredInputDeviceUID"
     private let systemInputDeviceUIDBeforeManualKey = "SystemInputDeviceUIDBeforeManual"
+
+    @MainActor
+    func testBottomOverlayRapidStopStartStopDoesNotDropFinalHide() async {
+        let audioPublisher = Just(CGFloat.zero).eraseToAnyPublisher()
+        let controller = BottomOverlayWindowController.shared
+
+        controller.prepare()
+        await Task.yield()
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        controller.hide()
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        let outcome = await controller.hideAndWait()
+
+        XCTAssertEqual(outcome, .hidden)
+        XCTAssertFalse(NotchContentState.shared.isBottomOverlayPresented)
+    }
+
+    @MainActor
+    func testBottomOverlayReportsWhenRapidRestartSupersedesHide() async {
+        let audioPublisher = Just(CGFloat.zero).eraseToAnyPublisher()
+        let controller = BottomOverlayWindowController.shared
+
+        controller.prepare()
+        await Task.yield()
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        let hideTask = Task { @MainActor in
+            await controller.hideAndWait()
+        }
+        await Task.yield()
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+
+        let hideOutcome = await hideTask.value
+        XCTAssertEqual(hideOutcome, .superseded)
+        XCTAssertTrue(NotchContentState.shared.isBottomOverlayPresented)
+        _ = await controller.hideAndWait()
+    }
 
     func testCoreAudioFrameCountUsesActualBufferChannelLayout() {
         XCTAssertEqual(fv_core_audio_buffer_frame_count(512 * 4, 4, 1), 512)
@@ -54,6 +91,80 @@ final class HotkeyShortcutTests: XCTestCase {
         XCTAssertFalse(ASRService.directCaptureShouldDisable(afterFailureCount: 2))
         XCTAssertTrue(ASRService.directCaptureShouldDisable(afterFailureCount: 3))
         XCTAssertTrue(ASRService.directCaptureShouldDisable(afterFailureCount: 4))
+    }
+
+    func testShortAudioSilenceGateRejectsOnlyClearShortSilence() {
+        let silence = [Float](repeating: 0.0005, count: 16_000)
+        let silenceAssessment = ASRService.assessShortAudioSilence(silence)
+        XCTAssertTrue(silenceAssessment.isEligible)
+        XCTAssertTrue(silenceAssessment.shouldSkipTranscription)
+
+        var quietSpeech = [Float](repeating: 0.0005, count: 16_000)
+        for index in 4000..<4320 {
+            quietSpeech[index] = index.isMultiple(of: 2) ? 0.012 : -0.012
+        }
+        let quietSpeechAssessment = ASRService.assessShortAudioSilence(quietSpeech)
+        XCTAssertTrue(quietSpeechAssessment.isEligible)
+        XCTAssertFalse(quietSpeechAssessment.shouldSkipTranscription)
+
+        let longSilence = [Float](repeating: 0, count: 64_001)
+        let longAssessment = ASRService.assessShortAudioSilence(longSilence)
+        XCTAssertFalse(longAssessment.isEligible)
+        XCTAssertFalse(longAssessment.shouldSkipTranscription)
+    }
+
+    func testShortAudioSilenceGateFailsOpenForInvalidSamples() {
+        var samples = [Float](repeating: 0, count: 8000)
+        samples[100] = .nan
+
+        let assessment = ASRService.assessShortAudioSilence(samples)
+
+        XCTAssertTrue(assessment.isEligible)
+        XCTAssertFalse(assessment.shouldSkipTranscription)
+    }
+
+    func testShortAudioSilenceGateRunsOnlyWhenEnabledForUnrecognizedDictation() {
+        XCTAssertFalse(ASRService.shouldAssessShortAudioSilence(
+            isEnabled: false,
+            useDictionaryTrainingPath: false,
+            hasRecognizedStreamingPreview: false
+        ))
+        XCTAssertFalse(ASRService.shouldAssessShortAudioSilence(
+            isEnabled: true,
+            useDictionaryTrainingPath: true,
+            hasRecognizedStreamingPreview: false
+        ))
+        XCTAssertFalse(ASRService.shouldAssessShortAudioSilence(
+            isEnabled: true,
+            useDictionaryTrainingPath: false,
+            hasRecognizedStreamingPreview: true
+        ))
+        XCTAssertTrue(ASRService.shouldAssessShortAudioSilence(
+            isEnabled: true,
+            useDictionaryTrainingPath: false,
+            hasRecognizedStreamingPreview: false
+        ))
+    }
+
+    @MainActor
+    func testSilentRecordingSettingRoundTripsAndOlderBackupsStillDecode() async throws {
+        let settingsStore = SettingsStore.shared
+        let originalValue = settingsStore.skipSilentRecordingsEnabled
+        defer { settingsStore.skipSilentRecordingsEnabled = originalValue }
+
+        settingsStore.skipSilentRecordingsEnabled = true
+        let document = await BackupService.shared.makeBackupDocument()
+        XCTAssertEqual(document.settings.skipSilentRecordingsEnabled, true)
+
+        let encoded = try BackupService.shared.encode(document)
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var settings = try XCTUnwrap(root["settings"] as? [String: Any])
+        settings.removeValue(forKey: "skipSilentRecordingsEnabled")
+        root["settings"] = settings
+
+        let legacyData = try JSONSerialization.data(withJSONObject: root)
+        let decoded = try BackupService.shared.decode(legacyData)
+        XCTAssertNil(decoded.settings.skipSilentRecordingsEnabled)
     }
 
     func testLegacyKeyboardShortcutPayloadDefaultsToKeyboardKind() throws {
