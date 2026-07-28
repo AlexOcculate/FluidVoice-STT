@@ -2443,8 +2443,40 @@ struct ContentView: View {
         self.hideOverlayAsync(reason: "after_output")
     }
 
+    private func showPrivateAIEditModeUnavailableIfNeeded() -> Bool {
+        let settings = SettingsStore.shared
+        let providerID = settings.rewriteModeLinkedToGlobal
+            ? settings.selectedProviderID
+            : settings.rewriteModeSelectedProviderID
+        guard PrivateFeatures.privateAIProvider,
+              providerID.trimmingCharacters(in: .whitespacesAndNewlines) ==
+              PrivateAIProviderFeature.shared.providerID
+        else {
+            return false
+        }
+
+        self.menuBarManager.setOverlayMode(.edit)
+        self.advanceOverlayLifecycle()
+        let expectedOverlayLifecycleID = self.overlayLifecycleID
+        self.menuBarManager.showRecordingOverlayImmediately()
+        NotchContentState.shared.showAIProcessingFailure(
+            message: "Edit Mode cannot be used with Fluid-1",
+            canRetry: false
+        )
+        self.menuBarManager.finishProcessingKeepingOverlayVisible()
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard self.overlayLifecycleID == expectedOverlayLifecycleID else { return }
+            NotchContentState.shared.clearAIProcessingFailure()
+            await self.menuBarManager.finishProcessingAndHideOverlay()
+        }
+        return true
+    }
+
     private func advanceOverlayLifecycle() {
         self.overlayLifecycleID &+= 1
+        NotchContentState.shared.clearAIProcessingFailure()
     }
 
     private func hideOverlayAsync(reason: String) {
@@ -3319,6 +3351,8 @@ struct ContentView: View {
                 }
             },
             rewriteModeCallback: {
+                guard !self.showPrivateAIEditModeUnavailableIfNeeded() else { return }
+
                 self.captureRecordingContext()
 
                 // Try to capture text first while still in the other app

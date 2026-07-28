@@ -60,6 +60,28 @@ final class DictationE2ETests: XCTestCase {
         ]
     }
 
+    func testOverlayFailureSupportsCustomNonRetryableMessage() {
+        let state = NotchContentState.shared
+        defer {
+            state.showAIProcessingFailure()
+            state.clearAIProcessingFailure()
+        }
+
+        state.showAIProcessingFailure(
+            message: "Edit Mode cannot be used with Fluid-1",
+            canRetry: false
+        )
+
+        XCTAssertTrue(state.isAIProcessingFailureVisible)
+        XCTAssertEqual(state.aiProcessingFailureMessage, "Edit Mode cannot be used with Fluid-1")
+        XCTAssertFalse(state.canRetryAIProcessingFailure)
+
+        state.showAIProcessingFailure()
+
+        XCTAssertEqual(state.aiProcessingFailureMessage, "AI Enhancement failed")
+        XCTAssertTrue(state.canRetryAIProcessingFailure)
+    }
+
     func testTranscriptionHistoryEntryClipboardTextPrefersProcessedText() {
         let entry = TranscriptionHistoryEntry(
             rawText: " raw transcript ",
