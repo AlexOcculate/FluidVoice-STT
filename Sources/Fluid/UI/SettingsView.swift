@@ -995,6 +995,17 @@ struct SettingsView: View {
                                     Divider().opacity(0.2)
 
                                     self.optionToggleRow(
+                                        title: "Skip Silent Recordings",
+                                        description: "Avoid transcription when a recording up to four seconds contains only clear silence. Disabled by default to preserve quiet speech.",
+                                        isOn: Binding(
+                                            get: { SettingsStore.shared.skipSilentRecordingsEnabled },
+                                            set: { SettingsStore.shared.skipSilentRecordingsEnabled = $0 }
+                                        ),
+                                        allowsDescriptionWrapping: true
+                                    )
+                                    Divider().opacity(0.2)
+
+                                    self.optionToggleRow(
                                         title: "Pause Media During Transcription",
                                         description: "Automatically pause currently playing audio/video when transcription starts. Resumes only if FluidVoice paused it.",
                                         isOn: Binding(

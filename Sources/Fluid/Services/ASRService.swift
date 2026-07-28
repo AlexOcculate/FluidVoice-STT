@@ -39,6 +39,21 @@ private actor TranscriptionExecutor {
     }
 }
 
+struct ShortAudioSilenceAssessment: Equatable {
+    let durationMilliseconds: Int
+    let isEligible: Bool
+    let shouldSkipTranscription: Bool
+    let peakAmplitude: Float
+    let rmsAmplitude: Float
+    let maximumFrameRMS: Float
+}
+
+enum AudioCaptureStartOutcome: Equatable {
+    case started
+    case alreadyActive
+    case failed
+}
+
 // swiftlint:disable file_length type_body_length
 /// A comprehensive speech recognition service that handles real-time audio transcription.
 ///
@@ -72,6 +87,90 @@ private actor TranscriptionExecutor {
 /// Models are cached locally to avoid repeated downloads.
 @MainActor
 final class ASRService: ObservableObject {
+    nonisolated static func shouldAssessShortAudioSilence(
+        isEnabled: Bool,
+        useDictionaryTrainingPath: Bool,
+        hasRecognizedStreamingPreview: Bool
+    ) -> Bool {
+        isEnabled && !useDictionaryTrainingPath && !hasRecognizedStreamingPreview
+    }
+
+    nonisolated static func assessShortAudioSilence(
+        _ samples: [Float],
+        sampleRate: Int = 16_000
+    ) -> ShortAudioSilenceAssessment {
+        let durationMilliseconds = sampleRate > 0
+            ? Int((Double(samples.count) / Double(sampleRate) * 1000).rounded())
+            : 0
+        let maximumSampleCount = max(sampleRate, 0) * 4
+        guard !samples.isEmpty, sampleRate > 0, samples.count <= maximumSampleCount else {
+            return ShortAudioSilenceAssessment(
+                durationMilliseconds: durationMilliseconds,
+                isEligible: false,
+                shouldSkipTranscription: false,
+                peakAmplitude: 0,
+                rmsAmplitude: 0,
+                maximumFrameRMS: 0
+            )
+        }
+
+        let frameSize = max(sampleRate / 50, 1) // 20 ms
+        var peak: Float = 0
+        var totalSquareSum = 0.0
+        var frameSquareSum = 0.0
+        var frameSampleCount = 0
+        var maximumFrameRMS: Float = 0
+
+        for sample in samples {
+            guard sample.isFinite else {
+                return ShortAudioSilenceAssessment(
+                    durationMilliseconds: durationMilliseconds,
+                    isEligible: true,
+                    shouldSkipTranscription: false,
+                    peakAmplitude: peak,
+                    rmsAmplitude: 0,
+                    maximumFrameRMS: maximumFrameRMS
+                )
+            }
+
+            let magnitude = abs(sample)
+            peak = max(peak, magnitude)
+            let square = Double(sample) * Double(sample)
+            totalSquareSum += square
+            frameSquareSum += square
+            frameSampleCount += 1
+
+            if frameSampleCount == frameSize {
+                maximumFrameRMS = max(
+                    maximumFrameRMS,
+                    Float(sqrt(frameSquareSum / Double(frameSampleCount)))
+                )
+                frameSquareSum = 0
+                frameSampleCount = 0
+            }
+        }
+
+        if frameSampleCount > 0 {
+            maximumFrameRMS = max(
+                maximumFrameRMS,
+                Float(sqrt(frameSquareSum / Double(frameSampleCount)))
+            )
+        }
+        let rms = Float(sqrt(totalSquareSum / Double(samples.count)))
+
+        // Calibrated conservatively against real FluidVoice captures. Requiring
+        // all three conditions keeps quiet speech and short words on the ASR path.
+        let shouldSkip = peak < 0.01 && rms < 0.002 && maximumFrameRMS < 0.0045
+        return ShortAudioSilenceAssessment(
+            durationMilliseconds: durationMilliseconds,
+            isEligible: true,
+            shouldSkipTranscription: shouldSkip,
+            peakAmplitude: peak,
+            rmsAmplitude: rms,
+            maximumFrameRMS: maximumFrameRMS
+        )
+    }
+
     nonisolated static func directCaptureDurationIsMismatched(
         capturedMilliseconds: Int,
         elapsedMilliseconds: Int
@@ -1319,19 +1418,20 @@ final class ASRService: ObservableObject {
     /// ## Errors
     /// If audio session configuration fails, the method will silently fail
     /// and `isRunning` will remain `false`. Check the debug logs for details.
+    @discardableResult
     func start(
         forDictionaryTraining: Bool = false,
         onCaptureStarted: (@MainActor () -> Void)? = nil
-    ) async {
+    ) async -> AudioCaptureStartOutcome {
         DebugLogger.shared.info("🎤 START() called - beginning recording session", source: "ASRService")
 
         guard self.micStatus == .authorized else {
             DebugLogger.shared.error("❌ START() blocked - mic not authorized", source: "ASRService")
-            return
+            return .failed
         }
         guard self.isRunning == false, self.isStarting == false else {
             DebugLogger.shared.warning("⚠️ START() blocked - already running (started: \(self.isRunning), starting: \(self.isStarting))", source: "ASRService")
-            return
+            return .alreadyActive
         }
         self.isStarting = true
         defer { self.finishAudioCaptureStart() }
@@ -1391,7 +1491,7 @@ final class ASRService: ObservableObject {
                     if didPause {
                         await MediaPlaybackService.shared.resumeIfWePaused(true)
                     }
-                    return
+                    return .started
                 }
                 self.didPauseMediaForThisSession = didPause
                 if didPause {
@@ -1419,6 +1519,7 @@ final class ASRService: ObservableObject {
                 DebugLogger.shared.debug("⏸️ Skipping streaming - model '\(model.displayName)' does not support real-time chunk processing", source: "ASRService")
             }
             DebugLogger.shared.info("✅ START() completed successfully", source: "ASRService")
+            return .started
         } catch {
             self.isDictionaryTrainingCaptureActive = false
             self.audioCapturePipeline.setRecordingEnabled(false)
@@ -1457,6 +1558,7 @@ final class ASRService: ObservableObject {
                 object: nil,
                 userInfo: ["errorMessage": errorMessage]
             )
+            return .failed
         }
     }
 
@@ -1632,6 +1734,45 @@ final class ASRService: ObservableObject {
             }
             self.benchmarkLog("stop_end result=empty totalMs=\(self.elapsedMilliseconds(since: stopStartedAt)) reason=no_audio")
             return ""
+        }
+
+        let hasRecognizedStreamingPreview = !self.partialTranscription
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        if Self.shouldAssessShortAudioSilence(
+            isEnabled: SettingsStore.shared.skipSilentRecordingsEnabled,
+            useDictionaryTrainingPath: useDictionaryTrainingPath,
+            hasRecognizedStreamingPreview: hasRecognizedStreamingPreview
+        ) {
+            let silenceGateStartedAt = ProcessInfo.processInfo.systemUptime
+            let silenceAssessment = Self.assessShortAudioSilence(pcm)
+            let silenceGateMicroseconds = Int(
+                ((ProcessInfo.processInfo.systemUptime - silenceGateStartedAt) * 1_000_000).rounded()
+            )
+            self.benchmarkLog(
+                "silence_gate eligible=\(silenceAssessment.isEligible) skip=\(silenceAssessment.shouldSkipTranscription) " +
+                    "audioMs=\(silenceAssessment.durationMilliseconds) analysisUs=\(silenceGateMicroseconds) " +
+                    "peak=\(String(format: "%.6f", silenceAssessment.peakAmplitude)) " +
+                    "rms=\(String(format: "%.6f", silenceAssessment.rmsAmplitude)) " +
+                    "maxFrameRms=\(String(format: "%.6f", silenceAssessment.maximumFrameRMS))"
+            )
+
+            if silenceAssessment.shouldSkipTranscription {
+                DebugLogger.shared.info(
+                    "Final ASR result | provider=\(self.transcriptionProvider.name) | samples=\(pcm.count) | textChars=0 | confidence=nil | reason=short_silence",
+                    source: "ASRService"
+                )
+                if shouldResumeMedia {
+                    await MediaPlaybackService.shared.resumeIfWePaused(true)
+                    DebugLogger.shared.info("🎵 Resumed system media after silent audio", source: "ASRService")
+                }
+                self.benchmarkLog(
+                    "stop_end result=empty totalMs=\(self.elapsedMilliseconds(since: stopStartedAt)) reason=short_silence"
+                )
+                return ""
+            }
+        } else if hasRecognizedStreamingPreview {
+            self.benchmarkLog("silence_gate eligible=false skip=false reason=streaming_preview")
         }
 
         // Pad sub-1s buffers with trailing silence so short utterances (e.g.
