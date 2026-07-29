@@ -18,6 +18,32 @@ enum AudioDevice {
         let name: String
         let hasInput: Bool
         let hasOutput: Bool
+        let transportType: UInt32
+
+        init(
+            id: AudioObjectID,
+            uid: String,
+            name: String,
+            hasInput: Bool,
+            hasOutput: Bool,
+            transportType: UInt32 = kAudioDeviceTransportTypeUnknown
+        ) {
+            self.id = id
+            self.uid = uid
+            self.name = name
+            self.hasInput = hasInput
+            self.hasOutput = hasOutput
+            self.transportType = transportType
+        }
+
+        var isBluetooth: Bool {
+            self.transportType == kAudioDeviceTransportTypeBluetooth ||
+                self.transportType == kAudioDeviceTransportTypeBluetoothLE
+        }
+
+        var isBuiltIn: Bool {
+            self.transportType == kAudioDeviceTransportTypeBuiltIn
+        }
     }
 
     static func listAllDevices() -> [Device] {
@@ -64,7 +90,21 @@ enum AudioDevice {
             let uid = self.getStringProperty(devId, selector: kAudioDevicePropertyDeviceUID, scope: kAudioObjectPropertyScopeGlobal) ?? ""
             let hasIn = self.hasChannels(devId, scope: kAudioObjectPropertyScopeInput)
             let hasOut = self.hasChannels(devId, scope: kAudioObjectPropertyScopeOutput)
-            devices.append(Device(id: devId, uid: uid, name: name, hasInput: hasIn, hasOutput: hasOut))
+            let transportType = self.getUInt32Property(
+                devId,
+                selector: kAudioDevicePropertyTransportType,
+                scope: kAudioObjectPropertyScopeGlobal
+            ) ?? kAudioDeviceTransportTypeUnknown
+            devices.append(
+                Device(
+                    id: devId,
+                    uid: uid,
+                    name: name,
+                    hasInput: hasIn,
+                    hasOutput: hasOut,
+                    transportType: transportType
+                )
+            )
         }
 
         return devices.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -171,6 +211,22 @@ enum AudioDevice {
         let status = AudioObjectGetPropertyData(devId, &address, 0, nil, &dataSize, &value)
         guard status == noErr else { return nil }
         return value?.takeRetainedValue() as String?
+    }
+
+    private static func getUInt32Property(
+        _ devId: AudioObjectID,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope
+    ) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(devId, &address, 0, nil, &dataSize, &value)
+        return status == noErr ? value : nil
     }
 
     private static func hasChannels(_ devId: AudioObjectID, scope: AudioObjectPropertyScope) -> Bool {
