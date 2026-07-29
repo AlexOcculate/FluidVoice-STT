@@ -63,37 +63,6 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
-    func testDirectCaptureDurationMismatchFilter() {
-        XCTAssertFalse(ASRService.directCaptureDurationIsMismatched(
-            capturedMilliseconds: 100,
-            elapsedMilliseconds: 499
-        ))
-        XCTAssertFalse(ASRService.directCaptureDurationIsMismatched(
-            capturedMilliseconds: 460,
-            elapsedMilliseconds: 500
-        ))
-        XCTAssertFalse(ASRService.directCaptureDurationIsMismatched(
-            capturedMilliseconds: 700,
-            elapsedMilliseconds: 1000
-        ))
-        XCTAssertFalse(ASRService.directCaptureDurationIsMismatched(
-            capturedMilliseconds: 1300,
-            elapsedMilliseconds: 1000
-        ))
-        XCTAssertTrue(ASRService.directCaptureDurationIsMismatched(
-            capturedMilliseconds: 333,
-            elapsedMilliseconds: 1000
-        ))
-        XCTAssertTrue(ASRService.directCaptureDurationIsMismatched(
-            capturedMilliseconds: 1500,
-            elapsedMilliseconds: 1000
-        ))
-        XCTAssertFalse(ASRService.directCaptureShouldDisable(afterFailureCount: 1))
-        XCTAssertFalse(ASRService.directCaptureShouldDisable(afterFailureCount: 2))
-        XCTAssertTrue(ASRService.directCaptureShouldDisable(afterFailureCount: 3))
-        XCTAssertTrue(ASRService.directCaptureShouldDisable(afterFailureCount: 4))
-    }
-
     func testShortAudioSilenceGateRejectsOnlyClearShortSilence() {
         let silence = [Float](repeating: 0.0005, count: 16_000)
         let silenceAssessment = ASRService.assessShortAudioSilence(silence)

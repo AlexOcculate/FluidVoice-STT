@@ -171,19 +171,6 @@ final class ASRService: ObservableObject {
         )
     }
 
-    nonisolated static func directCaptureDurationIsMismatched(
-        capturedMilliseconds: Int,
-        elapsedMilliseconds: Int
-    ) -> Bool {
-        guard elapsedMilliseconds >= 500 else { return false }
-        return capturedMilliseconds * 10 < elapsedMilliseconds * 7 ||
-            capturedMilliseconds * 10 > elapsedMilliseconds * 13
-    }
-
-    nonisolated static func directCaptureShouldDisable(afterFailureCount failureCount: Int) -> Bool {
-        failureCount >= 3
-    }
-
     @Published var isRunning: Bool = false
     @Published var finalText: String = ""
     @Published var partialTranscription: String = ""
@@ -719,7 +706,6 @@ final class ASRService: ObservableObject {
 
     private var directAudioInput: DirectCoreAudioInput?
     private var activeAudioCaptureBackend: AudioCaptureBackend = .none
-    private var isFallingBackFromDirectCapture = false
 
     private var hasPreparedAudioCapture: Bool {
         self.directAudioInput != nil || self.hasWarmAudioEngine
@@ -817,7 +803,7 @@ final class ASRService: ObservableObject {
         DebugLogger.shared.debug("Audio engine cooled to stopped warm state (\(reason))", source: "ASRService")
     }
 
-    private func prewarmAudioEngineIfPossible(
+    private func prewarmConfiguredAudioCaptureIfPossible(
         reason: String,
         allowDuringRouteRecovery: Bool = false
     ) {
@@ -839,10 +825,16 @@ final class ASRService: ObservableObject {
         }
 
         let startedAt = Date().timeIntervalSince1970
-        if SettingsStore.shared.experimentalDirectAudioCaptureEnabled,
-           self.prepareDirectAudioInputIfPossible(reason: reason)
-        {
-            self.benchmarkLog("direct_audio_prewarm reason=\(reason) elapsedMs=\(self.elapsedMilliseconds(since: startedAt))")
+        if SettingsStore.shared.experimentalDirectAudioCaptureEnabled {
+            do {
+                _ = try self.prepareDirectAudioInput(reason: reason)
+                self.benchmarkLog("direct_audio_prewarm reason=\(reason) elapsedMs=\(self.elapsedMilliseconds(since: startedAt))")
+            } catch {
+                DebugLogger.shared.warning(
+                    "Direct Core Audio prewarm failed: \(error.localizedDescription)",
+                    source: "ASRService"
+                )
+            }
             return
         }
 
@@ -862,97 +854,91 @@ final class ASRService: ObservableObject {
     /// Prepares the direct device callback without starting hardware IO. This
     /// keeps the default idle state privacy-friendly while removing device and
     /// ring allocation from the hotkey path.
-    @discardableResult
-    private func prepareDirectAudioInputIfPossible(reason: String) -> Bool {
-        guard self.micStatus == .authorized else { return false }
+    private func prepareDirectAudioInput(reason: String) throws -> DirectCoreAudioInput {
+        guard self.micStatus == .authorized else {
+            throw NSError(
+                domain: "ASRService",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Microphone access is not authorized."]
+            )
+        }
         guard let device = self.resolvedInputDeviceForCapture() else {
-            DebugLogger.shared.warning("No input device is available for direct capture", source: "ASRService")
-            return false
+            throw NSError(
+                domain: "ASRService",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "No input device is available for Direct Core Audio capture."]
+            )
         }
         if let directAudioInput = self.directAudioInput,
            directAudioInput.deviceID == device.id
         {
-            return true
+            return directAudioInput
         }
 
         self.directAudioInput?.invalidate()
         self.directAudioInput = nil
 
         let pipeline = self.audioCapturePipeline
-        do {
-            let directAudioInput = try DirectCoreAudioInput(deviceID: device.id) { samples, frameCount, sampleRate, inputHostTime, inputSampleTime in
-                pipeline.handle(
-                    samples: samples,
-                    frameCount: frameCount,
-                    sampleRate: sampleRate,
-                    inputHostTime: inputHostTime,
-                    inputSampleTime: inputSampleTime
-                )
-            }
-            self.directAudioInput = directAudioInput
-            DebugLogger.shared.info(
-                "Prepared direct Core Audio input '\(device.name)' " +
-                    "(\(Int(directAudioInput.sampleRate.rounded()))Hz, " +
-                    "\(directAudioInput.hardwareBufferFrameSize) frames, reason=\(reason))",
-                source: "ASRService"
+        let directAudioInput = try DirectCoreAudioInput(deviceID: device.id) { samples, frameCount, sampleRate, inputHostTime, inputSampleTime in
+            pipeline.handle(
+                samples: samples,
+                frameCount: frameCount,
+                sampleRate: sampleRate,
+                inputHostTime: inputHostTime,
+                inputSampleTime: inputSampleTime
             )
-            return true
-        } catch {
-            DebugLogger.shared.warning(
-                "Direct Core Audio input unavailable for '\(device.name)': \(error.localizedDescription). " +
-                    "Falling back to AVAudioEngine.",
-                source: "ASRService"
-            )
-            return false
         }
+        self.directAudioInput = directAudioInput
+        DebugLogger.shared.info(
+            "Prepared direct Core Audio input '\(device.name)' " +
+                "(\(Int(directAudioInput.sampleRate.rounded()))Hz, " +
+                "\(directAudioInput.hardwareBufferFrameSize) frames, reason=\(reason))",
+            source: "ASRService"
+        )
+        return directAudioInput
     }
 
-    private func startPreferredAudioCapture() async throws {
-        // A non-route path may have scheduled a fire-and-forget retirement. Do
-        // not let capture startup overlap any final AVAudioEngine release that is
-        // already queued.
-        await self.audioEngineRetirementDrain.waitForScheduledReleases()
-
-        let directCaptureEnabled = SettingsStore.shared.experimentalDirectAudioCaptureEnabled
-        if directCaptureEnabled,
-           self.prepareDirectAudioInputIfPossible(reason: "recording_start"),
-           let directAudioInput = self.directAudioInput
-        {
+    private func startConfiguredAudioCapture() async throws {
+        if SettingsStore.shared.experimentalDirectAudioCaptureEnabled {
+            // A non-route path may have scheduled a fire-and-forget retirement.
+            // Do not let direct capture startup overlap a queued AVAudioEngine
+            // release.
+            await self.audioEngineRetirementDrain.waitForScheduledReleases()
             do {
+                let directAudioInput = try self.prepareDirectAudioInput(reason: "recording_start")
                 try directAudioInput.start()
                 self.activeAudioCaptureBackend = .directCoreAudio
-                let callbackMs = Int(
-                    (Double(directAudioInput.hardwareBufferFrameSize) /
-                        directAudioInput.sampleRate * 1000).rounded()
-                )
+                let callbackDurationMilliseconds =
+                    Double(directAudioInput.hardwareBufferFrameSize) /
+                    directAudioInput.sampleRate * 1000
+                let callbackMs = Int(callbackDurationMilliseconds.rounded())
                 self.benchmarkLog(
                     "audio_backend kind=direct_core_audio device=\(directAudioInput.deviceID) " +
                         "frames=\(directAudioInput.hardwareBufferFrameSize) callbackMs=\(callbackMs)"
                 )
                 return
             } catch {
-                DebugLogger.shared.warning(
-                    "Direct Core Audio start failed: \(error.localizedDescription). Falling back to AVAudioEngine.",
+                self.directAudioInput?.invalidate()
+                self.directAudioInput = nil
+                DebugLogger.shared.error(
+                    "Direct Core Audio capture failed: \(error.localizedDescription)",
                     source: "ASRService"
                 )
-                directAudioInput.invalidate()
-                self.directAudioInput = nil
+                throw error
             }
         }
 
-        if directCaptureEnabled == false, let directAudioInput = self.directAudioInput {
+        if let directAudioInput = self.directAudioInput {
             directAudioInput.invalidate()
             self.directAudioInput = nil
         }
 
-        try await self.startCompatibilityAudioCapture(
-            reason: directCaptureEnabled ? "direct_unavailable" : "experimental_disabled"
-        )
+        try await self.startAVAudioEngineCapture()
     }
 
-    private func startCompatibilityAudioCapture(reason: String) async throws {
+    private func startAVAudioEngineCapture() async throws {
         await self.audioEngineRetirementDrain.waitForScheduledReleases()
-        self.benchmarkLog("audio_backend kind=av_audio_engine_fallback reason=\(reason)")
+        self.benchmarkLog("audio_backend kind=av_audio_engine reason=faster_recording_start_disabled")
         try self.configureSession()
         try await self.startEngine()
         try self.setupEngineTap()
@@ -987,84 +973,6 @@ final class ASRService: ObservableObject {
             break
         }
         self.activeAudioCaptureBackend = .none
-    }
-
-    private func handleDirectCaptureDurationMismatch(
-        sessionID: Int,
-        capturedMilliseconds: Int,
-        elapsedMilliseconds: Int
-    ) async {
-        guard sessionID == self.benchmarkSessionID,
-              self.isRunning,
-              self.activeAudioCaptureBackend == .directCoreAudio,
-              self.isFallingBackFromDirectCapture == false
-        else { return }
-
-        self.isFallingBackFromDirectCapture = true
-        defer { self.isFallingBackFromDirectCapture = false }
-
-        let failureCount = SettingsStore.shared.directAudioCaptureConsecutiveFailures + 1
-        SettingsStore.shared.directAudioCaptureConsecutiveFailures = failureCount
-        let shouldDisable = Self.directCaptureShouldDisable(afterFailureCount: failureCount)
-        if shouldDisable {
-            SettingsStore.shared.experimentalDirectAudioCaptureEnabled = false
-        }
-        NotificationService.showAudioCaptureFallback(
-            failureCount: failureCount,
-            experimentalSettingDisabled: shouldDisable
-        )
-        DebugLogger.shared.error(
-            "DIRECT_CAPTURE_RATE_MISMATCH session=\(sessionID) " +
-                "capturedMs=\(capturedMilliseconds) elapsedMs=\(elapsedMilliseconds); " +
-                "switching to AVAudioEngine",
-            source: "ASRService"
-        )
-        self.benchmarkLog(
-            "direct_capture_fallback reason=duration_mismatch " +
-                "capturedMs=\(capturedMilliseconds) elapsedMs=\(elapsedMilliseconds)"
-        )
-
-        self.audioCapturePipeline.setRecordingEnabled(false)
-        self.stopActiveAudioCapture()
-        self.directAudioInput?.invalidate()
-        self.directAudioInput = nil
-        await self.stopStreamingTimerAndAwait()
-        guard self.isRunning else { return }
-        self.audioBuffer.clear(keepingCapacity: true)
-        self.dictionaryTrainingAudioGeneration &+= 1
-        self.lastProcessedSampleCount = 0
-        self.benchmarkLastChunkSampleCount = 0
-        (self.transcriptionProvider as? FluidAudioProvider)?.resetStreamingPreviewCache()
-
-        do {
-            self.audioCapturePipeline.setRecordingEnabled(
-                true,
-                sessionID: sessionID,
-                startHostTime: mach_absolute_time()
-            )
-            try await self.startCompatibilityAudioCapture(reason: "duration_mismatch")
-            let model = SettingsStore.shared.selectedSpeechModel
-            if model.supportsStreaming, self.isDictionaryTrainingCaptureActive == false {
-                self.startStreamingTranscription()
-            }
-            DebugLogger.shared.info(
-                "Direct capture runtime fallback to AVAudioEngine succeeded",
-                source: "ASRService"
-            )
-        } catch {
-            self.audioCapturePipeline.setRecordingEnabled(false)
-            self.stopActiveAudioCapture()
-            DebugLogger.shared.error(
-                "Direct capture runtime fallback failed: \(error.localizedDescription)",
-                source: "ASRService"
-            )
-            await self.stopWithoutTranscription()
-            NotificationCenter.default.post(
-                name: NSNotification.Name("ASRServiceStartFailed"),
-                object: nil,
-                userInfo: ["errorMessage": "The microphone changed unexpectedly. Please try recording again."]
-            )
-        }
     }
 
     /// Applies the experimental capture preference immediately when idle.
@@ -1174,15 +1082,6 @@ final class ASRService: ObservableObject {
                     "ASR_BENCH",
                     message: "session=\(sessionID) first_audio sampleCount=\(sampleCount) frameLength=\(frameLength) sampleRate=\(Int(sampleRate.rounded())) bufferMs=\(bufferMs) acquisitionMs=\(acquisitionMs) elapsedMs=\(elapsedMs)",
                     source: "ASRBenchmark"
-                )
-            }
-        },
-        onDurationMismatch: { [weak self] sessionID, capturedMilliseconds, elapsedMilliseconds in
-            Task { @MainActor [weak self] in
-                await self?.handleDirectCaptureDurationMismatch(
-                    sessionID: sessionID,
-                    capturedMilliseconds: capturedMilliseconds,
-                    elapsedMilliseconds: elapsedMilliseconds
                 )
             }
         },
@@ -1313,7 +1212,7 @@ final class ASRService: ObservableObject {
 
         // Register the input callback and allocate its fixed ring now. This
         // does not start the device or show the microphone privacy indicator.
-        self.prewarmAudioEngineIfPossible(reason: "startup")
+        self.prewarmConfiguredAudioCaptureIfPossible(reason: "startup")
 
         // Check if models exist on disk and auto-load if present
         // This is done in a Task to support async model detection (e.g., AppleSpeechAnalyzerProvider)
@@ -1329,7 +1228,7 @@ final class ASRService: ObservableObject {
                 do {
                     try await self.ensureAsrReady()
                     DebugLogger.shared.info("Models auto-loaded successfully on startup", source: "ASRService")
-                    self.prewarmAudioEngineIfPossible(reason: "startup")
+                    self.prewarmConfiguredAudioCaptureIfPossible(reason: "startup")
                 } catch {
                     DebugLogger.shared.error("Failed to auto-load models on startup: \(error)", source: "ASRService")
                 }
@@ -1386,7 +1285,7 @@ final class ASRService: ObservableObject {
                 self.micPermissionGranted = granted
                 self.micStatus = granted ? .authorized : .denied
                 if granted {
-                    self.prewarmAudioEngineIfPossible(reason: "permission_granted")
+                    self.prewarmConfiguredAudioCaptureIfPossible(reason: "permission_granted")
                 }
             }
         }
@@ -1476,7 +1375,7 @@ final class ASRService: ObservableObject {
                 AppServices.shared.microphonePreferenceCoordinator.enforcePreferredInput(reason: "recording start")
             }
 
-            try await self.startPreferredAudioCapture()
+            try await self.startConfiguredAudioCapture()
             self.isDictionaryTrainingCaptureActive = forDictionaryTraining
             self.isRunning = true
             DebugLogger.shared.info("✅ Audio capture running", source: "ASRService")
@@ -1659,29 +1558,13 @@ final class ASRService: ObservableObject {
         self.stopMonitoringDevice()
         DebugLogger.shared.debug("✅ Device monitoring stopped", source: "ASRService")
 
-        if self.activeAudioCaptureBackend == .directCoreAudio,
-           let recordingStartedAt = self.benchmarkRecordingStartedAt
-        {
-            let elapsedMilliseconds = Int(
-                (Date().timeIntervalSince1970 - recordingStartedAt) * 1000
-            )
-            let capturedMilliseconds = self.audioBuffer.count * 1000 / 16_000
-            if elapsedMilliseconds >= 500,
-               Self.directCaptureDurationIsMismatched(
-                   capturedMilliseconds: capturedMilliseconds,
-                   elapsedMilliseconds: elapsedMilliseconds
-               ) == false
-            {
-                SettingsStore.shared.directAudioCaptureConsecutiveFailures = 0
-            }
-        }
         self.stopActiveAudioCapture()
         self.audioCapturePipeline.finishRecording()
 
         // A prepared direct IOProc owns only fixed memory and registration; it
         // does not run hardware, show the mic indicator, or hold Bluetooth in
         // headset mode. Keep it prepared across idle periods. The heavier
-        // AVAudioEngine fallback retains its existing bounded timeout.
+        // AVAudioEngine remains available when Faster Recording Start is disabled.
         if self.directAudioInput != nil {
             self.audioEngineStandbyTask?.cancel()
             self.audioEngineStandbyTask = nil
@@ -2632,7 +2515,7 @@ final class ASRService: ObservableObject {
         await self.retireAudioEngineAndWait(reason: "idle_route_change:\(request.reason)")
 
         guard request.generation == self.audioRouteRecoveryGeneration, Task.isCancelled == false else { return }
-        self.prewarmAudioEngineIfPossible(
+        self.prewarmConfiguredAudioCaptureIfPossible(
             reason: "idle_route_change",
             allowDuringRouteRecovery: true
         )
@@ -2658,7 +2541,7 @@ final class ASRService: ObservableObject {
                 sessionID: self.benchmarkSessionID,
                 startHostTime: mach_absolute_time()
             )
-            try await self.startPreferredAudioCapture()
+            try await self.startConfiguredAudioCapture()
 
             if let currentDevice = self.getCurrentlyBoundInputDevice() {
                 self.startMonitoringDevice(currentDevice.id)
@@ -3938,14 +3821,13 @@ private extension ASRService {
 
 //
 // Audio callbacks are not main-actor isolated. Direct Core Audio arrives through
-// a lock-free C ring; AVAudioEngine remains the compatibility fallback. This
-// pipeline owns timestamp trimming, 16 kHz conversion, levels, and session-safe
-// delivery without touching ASRService from a realtime callback.
+// a lock-free C ring. AVAudioEngine is used only when Faster Recording Start is
+// disabled. This pipeline owns timestamp trimming, 16 kHz conversion, levels,
+// and session-safe delivery without touching ASRService from a realtime callback.
 
 private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
     private let audioBuffer: ThreadSafeAudioBuffer
     private let onFirstAudio: (Int, Int, Int, Double, Int, Int) -> Void
-    private let onDurationMismatch: (Int, Int, Int) -> Void
     private let onLevel: (CGFloat) -> Void
 
     private let lock = NSLock()
@@ -3954,8 +3836,6 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
     private var recordingSessionID: Int = 0
     private var recordingStartHostTime: UInt64 = 0
     private var recordingStopHostTime: UInt64?
-    private var capturedOutputFrameCount: Int = 0
-    private var durationMismatchReported: Bool = false
     private var resampleSourceRate: Double = 0
     private var resampleSourceFrameCursor: Int64 = 0
     private var resampleNextSourcePosition: Double = 0
@@ -3978,12 +3858,10 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
     init(
         audioBuffer: ThreadSafeAudioBuffer,
         onFirstAudio: @escaping (Int, Int, Int, Double, Int, Int) -> Void,
-        onDurationMismatch: @escaping (Int, Int, Int) -> Void,
         onLevel: @escaping (CGFloat) -> Void
     ) {
         self.audioBuffer = audioBuffer
         self.onFirstAudio = onFirstAudio
-        self.onDurationMismatch = onDurationMismatch
         self.onLevel = onLevel
     }
 
@@ -3998,8 +3876,6 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
             self.recordingSessionID = sessionID
             self.recordingStartHostTime = startHostTime == 0 ? mach_absolute_time() : startHostTime
             self.recordingStopHostTime = nil
-            self.capturedOutputFrameCount = 0
-            self.durationMismatchReported = false
             self.resetResamplerLocked()
             self.lastInputSampleEnd = nil
             self.recordingEnabled = true
@@ -4009,8 +3885,6 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
             self.recordingSessionID = 0
             self.recordingStartHostTime = 0
             self.recordingStopHostTime = nil
-            self.capturedOutputFrameCount = 0
-            self.durationMismatchReported = false
             self.resetResamplerLocked()
             self.lastInputSampleEnd = nil
             self.levelHistory.removeAll(keepingCapacity: true)
@@ -4138,28 +4012,6 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
         if shouldReportFirstAudio {
             self.firstAudioReported = true
         }
-        self.capturedOutputFrameCount += mono16k.count
-        let capturedMilliseconds = self.capturedOutputFrameCount * 1000 / 16_000
-        // Compare sample duration with the hardware acquisition timeline. The
-        // consumer queue can be delayed under CPU pressure, but late delivery
-        // does not mean the captured audio clock is malformed.
-        let acceptedPacketEndHostTime = Self.hostTime(
-            inputHostTime,
-            advancedByFrames: acceptedRange.upperBound,
-            sampleRate: sampleRate
-        )
-        let elapsedMilliseconds = Self.elapsedMilliseconds(
-            from: startHostTime,
-            to: acceptedPacketEndHostTime
-        )
-        let shouldReportDurationMismatch = self.durationMismatchReported == false &&
-            ASRService.directCaptureDurationIsMismatched(
-                capturedMilliseconds: capturedMilliseconds,
-                elapsedMilliseconds: elapsedMilliseconds
-            )
-        if shouldReportDurationMismatch {
-            self.durationMismatchReported = true
-        }
         self.lock.unlock()
 
         self.audioBuffer.append(mono16k)
@@ -4184,13 +4036,6 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
                 sampleRate,
                 acquisitionMs,
                 deliveryMs
-            )
-        }
-        if shouldReportDurationMismatch {
-            self.onDurationMismatch(
-                recordingSessionID,
-                capturedMilliseconds,
-                elapsedMilliseconds
             )
         }
         let level = self.calculateAudioLevel(mono16k)
