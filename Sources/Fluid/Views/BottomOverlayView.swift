@@ -2275,7 +2275,8 @@ struct BottomOverlayView: View {
     }
 
     private var shouldReservePreviewArea: Bool {
-        self.layout.showsPreview && self.settings.enableStreamingPreview
+        self.layout.showsPreview &&
+            (self.settings.enableStreamingPreview || self.contentState.isAIProcessingFailureVisible)
     }
 
     private var overlayFrameHeight: CGFloat? {
@@ -2777,17 +2778,23 @@ struct BottomOverlayView: View {
 
     private var aiProcessingFailureView: some View {
         HStack(spacing: 8) {
-            Text("AI Enhancement failed")
+            Text(self.contentState.aiProcessingFailureMessage)
                 .font(.system(size: self.layout.transFontSize, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(
+                    self.contentState.canRetryAIProcessingFailure
+                        ? Color.white.opacity(0.9)
+                        : Color.orange.opacity(0.9)
+                )
                 .lineLimit(1)
                 .truncationMode(.tail)
 
             Spacer(minLength: 4)
 
-            self.failureIconButton(systemName: "arrow.clockwise", help: "Try again") {
-                self.contentState.clearAIProcessingFailure()
-                self.contentState.onReprocessLastRequested?()
+            if self.contentState.canRetryAIProcessingFailure {
+                self.failureIconButton(systemName: "arrow.clockwise", help: "Try again") {
+                    self.contentState.clearAIProcessingFailure()
+                    self.contentState.onReprocessLastRequested?()
+                }
             }
 
             self.failureIconButton(systemName: "xmark", help: "Dismiss") {

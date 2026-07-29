@@ -23,6 +23,8 @@ class NotchContentState: ObservableObject {
     @Published var promptPickerMode: SettingsStore.PromptMode = .dictate
     @Published var isProcessing: Bool = false // AI processing state
     @Published var isAIProcessingFailureVisible: Bool = false
+    @Published private(set) var aiProcessingFailureMessage: String = "AI Enhancement failed"
+    @Published private(set) var canRetryAIProcessingFailure: Bool = true
     @Published var activeDictationShortcutSlot: SettingsStore.DictationShortcutSlot? = nil
     @Published var promptModeOverrideProfileName: String? = nil // Name shown in overlay when prompt mode hotkey is active
     @Published var promptModeOverrideProfileID: String? = nil // ID of the active override profile (for checkmark in menu)
@@ -96,7 +98,12 @@ class NotchContentState: ObservableObject {
         self.isProcessing = processing
     }
 
-    func showAIProcessingFailure() {
+    func showAIProcessingFailure(
+        message: String = "AI Enhancement failed",
+        canRetry: Bool = true
+    ) {
+        self.aiProcessingFailureMessage = message
+        self.canRetryAIProcessingFailure = canRetry
         self.isAIProcessingFailureVisible = true
     }
 
@@ -905,24 +912,30 @@ struct NotchExpandedView: View {
 
             if self.contentState.isAIProcessingFailureVisible && !self.contentState.isProcessing {
                 HStack(spacing: 6) {
-                    Text("AI Enhancement failed")
+                    Text(self.contentState.aiProcessingFailureMessage)
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.82))
+                        .foregroundStyle(
+                            self.contentState.canRetryAIProcessingFailure
+                                ? Color.white.opacity(0.82)
+                                : Color.orange.opacity(0.9)
+                        )
                         .lineLimit(1)
                         .truncationMode(.tail)
 
                     Spacer(minLength: 2)
 
-                    Button {
-                        self.contentState.clearAIProcessingFailure()
-                        self.contentState.onReprocessLastRequested?()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 9, weight: .bold))
-                            .frame(width: 16, height: 16)
+                    if self.contentState.canRetryAIProcessingFailure {
+                        Button {
+                            self.contentState.clearAIProcessingFailure()
+                            self.contentState.onReprocessLastRequested?()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 9, weight: .bold))
+                                .frame(width: 16, height: 16)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Try again")
                     }
-                    .buttonStyle(.plain)
-                    .help("Try again")
 
                     Button {
                         self.contentState.clearAIProcessingFailure()
