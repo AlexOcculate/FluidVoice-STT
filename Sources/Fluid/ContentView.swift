@@ -2455,6 +2455,12 @@ struct ContentView: View {
             return false
         }
 
+        guard !self.asr.isRunningOrStarting,
+              !NotchContentState.shared.isProcessing
+        else {
+            return true
+        }
+
         self.menuBarManager.setOverlayMode(.edit)
         self.advanceOverlayLifecycle()
         let expectedOverlayLifecycleID = self.overlayLifecycleID
