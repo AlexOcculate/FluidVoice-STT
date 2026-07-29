@@ -13,6 +13,7 @@ final class HotkeyShortcutTests: XCTestCase {
     private let microphoneSelectionModeKey = "MicrophoneSelectionMode"
     private let preferredInputDeviceUIDKey = "PreferredInputDeviceUID"
     private let systemInputDeviceUIDBeforeManualKey = "SystemInputDeviceUIDBeforeManual"
+    private let experimentalDirectAudioCaptureEnabledKey = "ExperimentalDirectAudioCaptureEnabled"
 
     @MainActor
     func testBottomOverlayRapidStopStartStopDoesNotDropFinalHide() async {
@@ -165,6 +166,30 @@ final class HotkeyShortcutTests: XCTestCase {
         let legacyData = try JSONSerialization.data(withJSONObject: root)
         let decoded = try BackupService.shared.decode(legacyData)
         XCTAssertNil(decoded.settings.skipSilentRecordingsEnabled)
+    }
+
+    func testFasterRecordingStartDefaultsToEnabledWhenUnset() {
+        self.withRestoredDefaults(keys: [self.experimentalDirectAudioCaptureEnabledKey]) {
+            UserDefaults.standard.removeObject(forKey: self.experimentalDirectAudioCaptureEnabledKey)
+
+            XCTAssertTrue(SettingsStore.shared.experimentalDirectAudioCaptureEnabled)
+        }
+    }
+
+    func testFasterRecordingStartPreservesStoredDisabledPreference() {
+        self.withRestoredDefaults(keys: [self.experimentalDirectAudioCaptureEnabledKey]) {
+            UserDefaults.standard.set(false, forKey: self.experimentalDirectAudioCaptureEnabledKey)
+
+            XCTAssertFalse(SettingsStore.shared.experimentalDirectAudioCaptureEnabled)
+        }
+    }
+
+    func testFasterRecordingStartPreservesStoredEnabledPreference() {
+        self.withRestoredDefaults(keys: [self.experimentalDirectAudioCaptureEnabledKey]) {
+            UserDefaults.standard.set(true, forKey: self.experimentalDirectAudioCaptureEnabledKey)
+
+            XCTAssertTrue(SettingsStore.shared.experimentalDirectAudioCaptureEnabled)
+        }
     }
 
     func testLegacyKeyboardShortcutPayloadDefaultsToKeyboardKind() throws {
