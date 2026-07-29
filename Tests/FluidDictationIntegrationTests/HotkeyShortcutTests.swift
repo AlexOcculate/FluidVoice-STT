@@ -440,6 +440,35 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
+    func testAudioDeviceClassifiesBluetoothTransports() {
+        let bluetoothDevice = Self.device(
+            uid: "bluetooth",
+            name: "Bluetooth Microphone",
+            transportType: kAudioDeviceTransportTypeBluetooth
+        )
+        let bluetoothLEDevice = Self.device(
+            uid: "bluetooth-le",
+            name: "Bluetooth LE Microphone",
+            transportType: kAudioDeviceTransportTypeBluetoothLE
+        )
+
+        XCTAssertTrue(bluetoothDevice.isBluetooth)
+        XCTAssertTrue(bluetoothLEDevice.isBluetooth)
+        XCTAssertFalse(bluetoothDevice.isBuiltIn)
+        XCTAssertFalse(bluetoothLEDevice.isBuiltIn)
+    }
+
+    func testAudioDeviceClassifiesBuiltInTransport() {
+        let builtInDevice = Self.device(
+            uid: "built-in",
+            name: "MacBook Pro Microphone",
+            transportType: kAudioDeviceTransportTypeBuiltIn
+        )
+
+        XCTAssertTrue(builtInDevice.isBuiltIn)
+        XCTAssertFalse(builtInDevice.isBluetooth)
+    }
+
     @MainActor
     func testMicrophoneCoordinatorSkipsSystemMode() throws {
         try self.withRestoredDefaults(keys: [
@@ -554,13 +583,18 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
-    private static func device(uid: String, name: String) -> AudioDevice.Device {
+    private static func device(
+        uid: String,
+        name: String,
+        transportType: UInt32 = kAudioDeviceTransportTypeUnknown
+    ) -> AudioDevice.Device {
         AudioDevice.Device(
             id: AudioObjectID(abs(uid.hashValue % 100_000) + 1),
             uid: uid,
             name: name,
             hasInput: true,
-            hasOutput: false
+            hasOutput: false,
+            transportType: transportType
         )
     }
 
