@@ -182,6 +182,26 @@ final class HotkeyShortcutTests: XCTestCase {
         ))
     }
 
+    func testDirectRecoveryTracksOnlyPreferredInputAvailability() {
+        let previousUIDs = Set(["preferred", "built-in"])
+
+        XCTAssertFalse(AudioCaptureIdlePolicy.didPreferredInputAvailabilityChange(
+            preferredInputUID: "preferred",
+            previousInputUIDs: previousUIDs,
+            currentInputUIDs: previousUIDs.union(["unrelated"])
+        ))
+        XCTAssertTrue(AudioCaptureIdlePolicy.didPreferredInputAvailabilityChange(
+            preferredInputUID: "preferred",
+            previousInputUIDs: previousUIDs,
+            currentInputUIDs: ["built-in"]
+        ))
+        XCTAssertTrue(AudioCaptureIdlePolicy.didPreferredInputAvailabilityChange(
+            preferredInputUID: "preferred",
+            previousInputUIDs: ["built-in"],
+            currentInputUIDs: previousUIDs
+        ))
+    }
+
     func testEngineConfigurationChangesRecoverOnlyDuringCaptureTransitions() {
         XCTAssertFalse(AudioCaptureIdlePolicy.shouldRecoverEngineConfigurationChange(
             isRunning: false,

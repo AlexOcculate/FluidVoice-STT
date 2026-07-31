@@ -3255,11 +3255,12 @@ final class ASRService: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let cachedUIDs = self.cachedDeviceUIDs
+                let currentUIDs = Set(currentDevices.map(\.uid))
 
                 DebugLogger.shared.debug("Current input devices: \(currentDevices.map { $0.name }.joined(separator: ", "))", source: "ASRService")
 
                 if SettingsStore.shared.microphoneSelectionMode == .manual,
-                   Set(currentDevices.map(\.uid)) != cachedUIDs
+                   currentUIDs != cachedUIDs
                 {
                     if AudioCaptureIdlePolicy.shouldEnforceSystemPreferredInput(
                         experimentalDirectAudioCaptureEnabled: SettingsStore.shared.experimentalDirectAudioCaptureEnabled
@@ -3267,9 +3268,13 @@ final class ASRService: ObservableObject {
                         AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
                             reason: "input device list changed"
                         )
-                    } else {
+                    } else if AudioCaptureIdlePolicy.didPreferredInputAvailabilityChange(
+                        preferredInputUID: SettingsStore.shared.preferredInputDeviceUID,
+                        previousInputUIDs: cachedUIDs,
+                        currentInputUIDs: currentUIDs
+                    ) {
                         self.scheduleAudioRouteRecovery(
-                            reason: "direct input device list changed",
+                            reason: "direct preferred input availability changed",
                             requiresIdlePrewarm: true
                         )
                     }
