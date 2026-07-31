@@ -827,20 +827,9 @@ final class ASRService: ObservableObject {
         self.audioEngineStandbyTask = nil
 
         await self.directAudioLifecycleController.invalidate(reason: reason)
-        self.activeAudioCaptureBackend = .none
-
-        if self.isEngineTapInstalled {
-            if let engine = self.engineStorage as? AVAudioEngine {
-                engine.inputNode.removeTap(onBus: 0)
-            }
-            self.isEngineTapInstalled = false
-        }
-        if let engine = self.engineStorage as? AVAudioEngine, engine.isRunning {
-            engine.stop()
-        }
-        self.audioCapturePipeline.clearPreroll()
-        self.benchmarkLog("audio_engine_standby cooled=true reason=\(reason)")
-        DebugLogger.shared.debug("Audio engine cooled to stopped warm state (\(reason))", source: "ASRService")
+        await self.retireAudioEngineAndWait(reason: reason)
+        self.benchmarkLog("audio_engine_standby retired=true reason=\(reason)")
+        DebugLogger.shared.debug("Audio engine fully retired from standby (\(reason))", source: "ASRService")
     }
 
     private func prewarmConfiguredAudioCaptureIfPossible(
@@ -865,31 +854,35 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.debug("Audio engine prewarm skipped - route recovery active", source: "ASRService")
             return
         }
+        guard AudioCaptureIdlePolicy.shouldPrewarmCapture(
+            experimentalDirectAudioCaptureEnabled: SettingsStore.shared.experimentalDirectAudioCaptureEnabled
+        ) else {
+            // Constructing AVAudioEngine while idle instantiates its input and
+            // output audio units. Bluetooth headsets can then remain in the
+            // low-bandwidth HFP route even though no recording is active.
+            if self.hasWarmAudioEngine {
+                await self.retireAudioEngineAndWait(reason: "legacy_idle_prewarm_suppressed")
+            }
+            DebugLogger.shared.debug(
+                "Legacy AVAudioEngine idle prewarm skipped to preserve playback quality",
+                source: "ASRService"
+            )
+            return
+        }
         guard self.hasPreparedAudioCapture == false else {
             DebugLogger.shared.debug("Audio capture prewarm skipped - backend already prepared", source: "ASRService")
             return
         }
 
         let startedAt = Date().timeIntervalSince1970
-        if SettingsStore.shared.experimentalDirectAudioCaptureEnabled {
-            do {
-                _ = try await self.prepareDirectAudioInput(reason: reason)
-                self.benchmarkLog("direct_audio_prewarm reason=\(reason) elapsedMs=\(self.elapsedMilliseconds(since: startedAt))")
-            } catch {
-                DebugLogger.shared.warning(
-                    "Direct Core Audio prewarm failed: \(error.localizedDescription)",
-                    source: "ASRService"
-                )
-            }
-            return
-        }
-
         do {
-            try self.configureSession()
-            self.benchmarkLog("audio_engine_prewarm reason=\(reason) elapsedMs=\(self.elapsedMilliseconds(since: startedAt))")
+            _ = try await self.prepareDirectAudioInput(reason: reason)
+            self.benchmarkLog("direct_audio_prewarm reason=\(reason) elapsedMs=\(self.elapsedMilliseconds(since: startedAt))")
         } catch {
-            self.retireAudioEngine(reason: "prewarm_failed")
-            DebugLogger.shared.warning("Audio engine prewarm failed: \(error.localizedDescription)", source: "ASRService")
+            DebugLogger.shared.warning(
+                "Direct Core Audio prewarm failed: \(error.localizedDescription)",
+                source: "ASRService"
+            )
         }
     }
 
@@ -1262,6 +1255,13 @@ final class ASRService: ObservableObject {
         // Check microphone permission (deferred from init to avoid AVFCapture race condition)
         self.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         self.micPermissionGranted = (self.micStatus == .authorized)
+
+        let microphonePreferenceCoordinator =
+            AppServices.shared.microphonePreferenceCoordinator
+        _ = microphonePreferenceCoordinator.enforcePreferredInput(reason: "startup")
+        microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
+            reason: "startup"
+        )
 
         self.registerDefaultDeviceChangeListener()
         self.registerEngineConfigurationChangeObserver()
@@ -1832,14 +1832,14 @@ final class ASRService: ObservableObject {
 
         // A prepared direct IOProc owns only fixed memory and registration; it
         // does not run hardware, show the mic indicator, or hold Bluetooth in
-        // headset mode. Keep it prepared across idle periods. The heavier
-        // AVAudioEngine remains available when Faster Recording Start is disabled.
+        // headset mode. Keep it prepared across idle periods. AVAudioEngine,
+        // however, must be fully released so Bluetooth returns to stereo A2DP.
         if self.directAudioLifecycleController.snapshot.isPrepared {
             self.audioEngineStandbyTask?.cancel()
             self.audioEngineStandbyTask = nil
             DebugLogger.shared.debug("♻️ Direct audio capture remains prepared", source: "ASRService")
         } else {
-            self.scheduleAudioEngineStandbyRetirement()
+            await self.retireAudioEngineAndWait(reason: "recording_stop_release")
         }
 
         // Capture has fully ended — invoke the callback so callers can play a
@@ -2979,10 +2979,10 @@ final class ASRService: ObservableObject {
 
     private func handleDefaultInputChanged() {
         if SettingsStore.shared.microphoneSelectionMode == .manual {
+            AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
+                reason: "default input changed"
+            )
             if self.isRunning || self.isStarting {
-                AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
-                    reason: "default input changed"
-                )
                 self.scheduleAudioRouteRecovery(reason: "manual preferred input reasserted")
             }
             return
@@ -3004,6 +3004,16 @@ final class ASRService: ObservableObject {
         guard let currentEngine = self.engineStorage as? AVAudioEngine,
               ObjectIdentifier(currentEngine) == changedEngineIdentifier
         else { return }
+        guard AudioCaptureIdlePolicy.shouldRecoverEngineConfigurationChange(
+            isRunning: self.isRunning,
+            isStarting: self.isStarting
+        ) else {
+            DebugLogger.shared.debug(
+                "Ignoring AVAudioEngine configuration change while capture is idle",
+                source: "ASRService"
+            )
+            return
+        }
 
         self.scheduleAudioRouteRecovery(reason: "engine configuration changed")
     }
@@ -3235,8 +3245,7 @@ final class ASRService: ObservableObject {
 
                 DebugLogger.shared.debug("Current input devices: \(currentDevices.map { $0.name }.joined(separator: ", "))", source: "ASRService")
 
-                if self.isRunning,
-                   SettingsStore.shared.microphoneSelectionMode == .manual,
+                if SettingsStore.shared.microphoneSelectionMode == .manual,
                    Set(currentDevices.map(\.uid)) != cachedUIDs
                 {
                     AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(

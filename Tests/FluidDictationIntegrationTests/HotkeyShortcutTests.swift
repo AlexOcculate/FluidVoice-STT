@@ -161,6 +161,33 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
+    func testLegacyAVAudioEngineDoesNotPrewarmWhileIdle() {
+        XCTAssertFalse(AudioCaptureIdlePolicy.shouldPrewarmCapture(
+            experimentalDirectAudioCaptureEnabled: false
+        ))
+    }
+
+    func testPreparedDirectCaptureMayRemainWarmWhileIdle() {
+        XCTAssertTrue(AudioCaptureIdlePolicy.shouldPrewarmCapture(
+            experimentalDirectAudioCaptureEnabled: true
+        ))
+    }
+
+    func testEngineConfigurationChangesRecoverOnlyDuringCaptureTransitions() {
+        XCTAssertFalse(AudioCaptureIdlePolicy.shouldRecoverEngineConfigurationChange(
+            isRunning: false,
+            isStarting: false
+        ))
+        XCTAssertTrue(AudioCaptureIdlePolicy.shouldRecoverEngineConfigurationChange(
+            isRunning: true,
+            isStarting: false
+        ))
+        XCTAssertTrue(AudioCaptureIdlePolicy.shouldRecoverEngineConfigurationChange(
+            isRunning: false,
+            isStarting: true
+        ))
+    }
+
     func testLegacyKeyboardShortcutPayloadDefaultsToKeyboardKind() throws {
         let json = #"{"keyCode":61,"modifierFlagsRawValue":0}"#
         let data = try XCTUnwrap(json.data(using: .utf8))
