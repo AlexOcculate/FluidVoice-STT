@@ -251,7 +251,9 @@ struct ContentView: View {
     @State private var visualizerNoiseThreshold: Double = SettingsStore.shared.visualizerNoiseThreshold
     @State private var inputDevices: [AudioDevice.Device] = []
     @State private var outputDevices: [AudioDevice.Device] = []
-    @State private var selectedInputUID: String = AudioDevice.getDefaultInputDevice()?.uid ?? ""
+    // Populated by gated audio initialization; querying Core Audio while SwiftUI
+    // constructs this view can race AttributeGraph metadata processing.
+    @State private var selectedInputUID: String = ""
     @State private var selectedOutputUID: String = SettingsStore.shared.preferredOutputDeviceUID ?? ""
     @State private var microphoneSelectionMode: SettingsStore.MicrophoneSelectionMode = SettingsStore.shared.microphoneSelectionMode
 
