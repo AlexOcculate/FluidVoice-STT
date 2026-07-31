@@ -874,6 +874,22 @@ final class ASRService: ObservableObject {
             return
         }
 
+        // A legacy stop releases AVAudioEngine on the serial retirement drain.
+        // Do not register a direct Core Audio backend until that teardown has
+        // completed, then recheck state because this await yields the main actor.
+        await self.audioEngineRetirementDrain.waitForScheduledReleases()
+        guard self.isTerminating == false,
+              self.isRunning == false,
+              self.isStarting == false || allowDuringRouteRecovery,
+              self.hasPreparedAudioCapture == false
+        else {
+            DebugLogger.shared.debug(
+                "Audio capture prewarm skipped - state changed while waiting for engine retirement",
+                source: "ASRService"
+            )
+            return
+        }
+
         let startedAt = Date().timeIntervalSince1970
         do {
             _ = try await self.prepareDirectAudioInput(reason: reason)
