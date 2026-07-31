@@ -557,6 +557,10 @@ struct ContentView: View {
         self.appear = true
         self.refreshAccessibilityPermissionState()
 
+        Task {
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+        }
+
         self.handleMenuBarNavigation(self.menuBarManager.requestedNavigationDestination)
         if UserDefaults.standard.bool(forKey: self.accessibilityRestartFlagKey) {
             UserDefaults.standard.set(false, forKey: self.accessibilityRestartFlagKey)

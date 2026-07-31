@@ -1256,13 +1256,6 @@ final class ASRService: ObservableObject {
         self.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         self.micPermissionGranted = (self.micStatus == .authorized)
 
-        let microphonePreferenceCoordinator =
-            AppServices.shared.microphonePreferenceCoordinator
-        _ = microphonePreferenceCoordinator.enforcePreferredInput(reason: "startup")
-        microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
-            reason: "startup"
-        )
-
         self.registerDefaultDeviceChangeListener()
         self.registerEngineConfigurationChangeObserver()
         self.registerDeviceListChangeListener()
@@ -1273,7 +1266,18 @@ final class ASRService: ObservableObject {
         // Register the input callback and allocate its fixed ring now. This
         // does not start the device or show the microphone privacy indicator.
         Task { @MainActor [weak self] in
-            await self?.prewarmConfiguredAudioCaptureIfPossible(reason: "startup")
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+            await AudioStartupGate.shared.waitUntilOpen()
+            guard let self, self.isTerminating == false else { return }
+
+            let microphonePreferenceCoordinator =
+                AppServices.shared.microphonePreferenceCoordinator
+            _ = microphonePreferenceCoordinator.enforcePreferredInput(reason: "startup")
+            microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
+                reason: "startup"
+            )
+
+            await self.prewarmConfiguredAudioCaptureIfPossible(reason: "startup")
         }
 
         // Check if models exist on disk and auto-load if present
@@ -1832,14 +1836,17 @@ final class ASRService: ObservableObject {
 
         // A prepared direct IOProc owns only fixed memory and registration; it
         // does not run hardware, show the mic indicator, or hold Bluetooth in
-        // headset mode. Keep it prepared across idle periods. AVAudioEngine,
-        // however, must be fully released so Bluetooth returns to stereo A2DP.
+        // headset mode. Keep it prepared across idle periods. AVAudioEngine is
+        // detached immediately and released by the off-main serial drain so
+        // Bluetooth can return to stereo A2DP without delaying stop cues or
+        // transcription. The next capture waits on the drain before creating
+        // another engine.
         if self.directAudioLifecycleController.snapshot.isPrepared {
             self.audioEngineStandbyTask?.cancel()
             self.audioEngineStandbyTask = nil
             DebugLogger.shared.debug("♻️ Direct audio capture remains prepared", source: "ASRService")
         } else {
-            await self.retireAudioEngineAndWait(reason: "recording_stop_release")
+            self.retireAudioEngine(reason: "recording_stop_release")
         }
 
         // Capture has fully ended — invoke the callback so callers can play a
