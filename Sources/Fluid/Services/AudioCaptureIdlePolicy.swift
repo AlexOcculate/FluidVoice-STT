@@ -3,6 +3,12 @@ enum AudioCaptureIdlePolicy {
         experimentalDirectAudioCaptureEnabled
     }
 
+    static func shouldEnforceSystemPreferredInput(
+        experimentalDirectAudioCaptureEnabled: Bool
+    ) -> Bool {
+        experimentalDirectAudioCaptureEnabled == false
+    }
+
     static func shouldRecoverEngineConfigurationChange(
         isRunning: Bool,
         isStarting: Bool

@@ -1251,10 +1251,25 @@ final class ASRService: ObservableObject {
 
     /// Call this AFTER the app has finished launching to complete ASR initialization.
     /// This must be called from onAppear or later, never during init.
-    func initialize() {
+    func initialize() async {
+        await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+        await AudioStartupGate.shared.waitUntilOpen()
+        guard self.isTerminating == false else { return }
+
         // Check microphone permission (deferred from init to avoid AVFCapture race condition)
         self.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         self.micPermissionGranted = (self.micStatus == .authorized)
+
+        if AudioCaptureIdlePolicy.shouldEnforceSystemPreferredInput(
+            experimentalDirectAudioCaptureEnabled: SettingsStore.shared.experimentalDirectAudioCaptureEnabled
+        ) {
+            let microphonePreferenceCoordinator =
+                AppServices.shared.microphonePreferenceCoordinator
+            _ = microphonePreferenceCoordinator.enforcePreferredInput(reason: "startup")
+            microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
+                reason: "startup"
+            )
+        }
 
         self.registerDefaultDeviceChangeListener()
         self.registerEngineConfigurationChangeObserver()
@@ -1265,20 +1280,7 @@ final class ASRService: ObservableObject {
 
         // Register the input callback and allocate its fixed ring now. This
         // does not start the device or show the microphone privacy indicator.
-        Task { @MainActor [weak self] in
-            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
-            await AudioStartupGate.shared.waitUntilOpen()
-            guard let self, self.isTerminating == false else { return }
-
-            let microphonePreferenceCoordinator =
-                AppServices.shared.microphonePreferenceCoordinator
-            _ = microphonePreferenceCoordinator.enforcePreferredInput(reason: "startup")
-            microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
-                reason: "startup"
-            )
-
-            await self.prewarmConfiguredAudioCaptureIfPossible(reason: "startup")
-        }
+        await self.prewarmConfiguredAudioCaptureIfPossible(reason: "startup")
 
         // Check if models exist on disk and auto-load if present
         // This is done in a Task to support async model detection (e.g., AppleSpeechAnalyzerProvider)
@@ -2986,11 +2988,15 @@ final class ASRService: ObservableObject {
 
     private func handleDefaultInputChanged() {
         if SettingsStore.shared.microphoneSelectionMode == .manual {
-            AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
-                reason: "default input changed"
-            )
-            if self.isRunning || self.isStarting {
-                self.scheduleAudioRouteRecovery(reason: "manual preferred input reasserted")
+            if AudioCaptureIdlePolicy.shouldEnforceSystemPreferredInput(
+                experimentalDirectAudioCaptureEnabled: SettingsStore.shared.experimentalDirectAudioCaptureEnabled
+            ) {
+                AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
+                    reason: "default input changed"
+                )
+                if self.isRunning || self.isStarting {
+                    self.scheduleAudioRouteRecovery(reason: "manual preferred input reasserted")
+                }
             }
             return
         }
@@ -3255,9 +3261,18 @@ final class ASRService: ObservableObject {
                 if SettingsStore.shared.microphoneSelectionMode == .manual,
                    Set(currentDevices.map(\.uid)) != cachedUIDs
                 {
-                    AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
-                        reason: "input device list changed"
-                    )
+                    if AudioCaptureIdlePolicy.shouldEnforceSystemPreferredInput(
+                        experimentalDirectAudioCaptureEnabled: SettingsStore.shared.experimentalDirectAudioCaptureEnabled
+                    ) {
+                        AppServices.shared.microphonePreferenceCoordinator.stabilizePreferredInputAfterHardwareChange(
+                            reason: "input device list changed"
+                        )
+                    } else {
+                        self.scheduleAudioRouteRecovery(
+                            reason: "direct input device list changed",
+                            requiresIdlePrewarm: true
+                        )
+                    }
                 }
 
                 self.cacheCurrentDeviceList(currentDevices)

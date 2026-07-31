@@ -173,6 +173,15 @@ final class HotkeyShortcutTests: XCTestCase {
         ))
     }
 
+    func testSystemPreferredInputIsEnforcedOnlyForLegacyCapture() {
+        XCTAssertTrue(AudioCaptureIdlePolicy.shouldEnforceSystemPreferredInput(
+            experimentalDirectAudioCaptureEnabled: false
+        ))
+        XCTAssertFalse(AudioCaptureIdlePolicy.shouldEnforceSystemPreferredInput(
+            experimentalDirectAudioCaptureEnabled: true
+        ))
+    }
+
     func testEngineConfigurationChangesRecoverOnlyDuringCaptureTransitions() {
         XCTAssertFalse(AudioCaptureIdlePolicy.shouldRecoverEngineConfigurationChange(
             isRunning: false,
