@@ -3097,15 +3097,25 @@ struct ContentView: View {
         if shouldShowDictationOverlay {
             self.menuBarManager.setOverlayMode(.dictation)
             self.menuBarManager.showRecordingOverlayImmediately()
+            DebugLogger.shared.benchmark(
+                "APP_BENCH",
+                message: "overlay_phase phase=connecting",
+                source: "AppBenchmark"
+            )
         }
 
         Task {
-            if shouldPlayStartSound, !self.asr.isRunning {
-                TranscriptionSoundPlayer.shared.playStartSound()
-            }
             let startOutcome = await self.asr.start(onCaptureStarted: {
+                if shouldPlayStartSound {
+                    TranscriptionSoundPlayer.shared.playStartSound()
+                }
                 self.captureRecordingContext()
                 self.prewarmPrivateAIDictationIfNeeded(for: .primary)
+                DebugLogger.shared.benchmark(
+                    "APP_BENCH",
+                    message: "overlay_phase phase=recording trigger=first_pcm",
+                    source: "AppBenchmark"
+                )
             })
             if startOutcome == .failed {
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
@@ -3342,7 +3352,7 @@ struct ContentView: View {
                 // Set overlay mode to command
                 self.menuBarManager.setOverlayMode(.command)
 
-                guard !self.asr.isRunning else { return }
+                guard !self.asr.isRunningOrStarting else { return }
 
                 self.advanceOverlayLifecycle()
 
@@ -3351,9 +3361,16 @@ struct ContentView: View {
                     "Starting voice recording for command",
                     source: "ContentView"
                 )
-                TranscriptionSoundPlayer.shared.playStartSound()
                 Task {
-                    await self.asr.start()
+                    let startOutcome = await self.asr.start(onCaptureStarted: {
+                        TranscriptionSoundPlayer.shared.playStartSound()
+                        self.appBench("overlay_phase phase=recording trigger=first_pcm mode=command")
+                    })
+                    if startOutcome == .failed {
+                        self.menuBarManager.hideRecordingOverlayImmediately(
+                            reason: "command_asr_start_failed"
+                        )
+                    }
                 }
             },
             rewriteModeCallback: {
@@ -3384,15 +3401,22 @@ struct ContentView: View {
                 // Set flag so stopAndProcessTranscription knows to process as rewrite
                 self.setActiveRecordingMode(.edit)
 
-                guard !self.asr.isRunning else { return }
+                guard !self.asr.isRunningOrStarting else { return }
 
                 self.advanceOverlayLifecycle()
 
                 // Start recording immediately for the edit instruction
                 DebugLogger.shared.info("Starting voice recording for edit mode", source: "ContentView")
-                TranscriptionSoundPlayer.shared.playStartSound()
                 Task {
-                    await self.asr.start()
+                    let startOutcome = await self.asr.start(onCaptureStarted: {
+                        TranscriptionSoundPlayer.shared.playStartSound()
+                        self.appBench("overlay_phase phase=recording trigger=first_pcm mode=edit")
+                    })
+                    if startOutcome == .failed {
+                        self.menuBarManager.hideRecordingOverlayImmediately(
+                            reason: "edit_asr_start_failed"
+                        )
+                    }
                 }
             },
             isDictateRecordingProvider: {
@@ -3726,16 +3750,18 @@ extension ContentView {
             self.menuBarManager.setOverlayMode(.dictation)
             self.menuBarManager.showRecordingOverlayImmediately()
             self.appBench("overlay_mode_requested mode=Dictation")
+            self.appBench("overlay_phase phase=connecting")
         }
         Task {
             let asrStartStartedAt = ProcessInfo.processInfo.systemUptime
             DebugLogger.shared.benchmark("APP_BENCH", message: "asr_start_call", source: "AppBenchmark")
-            if SettingsStore.shared.enableTranscriptionSounds, !self.asr.isRunning {
-                TranscriptionSoundPlayer.shared.playStartSound()
-            }
             let startOutcome = await self.asr.start(onCaptureStarted: {
+                if SettingsStore.shared.enableTranscriptionSounds {
+                    TranscriptionSoundPlayer.shared.playStartSound()
+                }
                 self.captureRecordingContext()
                 self.prewarmPrivateAIDictationIfNeeded(for: slot)
+                self.appBench("overlay_phase phase=recording trigger=first_pcm")
             })
             if startOutcome == .failed {
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")

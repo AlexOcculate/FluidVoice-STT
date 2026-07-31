@@ -11,7 +11,7 @@ import Foundation
 
 // MARK: - Audio Device Manager
 
-enum AudioDevice {
+nonisolated enum AudioDevice {
     struct Device: Identifiable, Hashable {
         let id: AudioObjectID
         let uid: String
@@ -284,6 +284,28 @@ final class AudioHardwareObserver: ObservableObject {
     /// This must be called from onAppear or later, never during init.
     func startObserving() {
         self.register()
+    }
+
+    func restartObservingAfterAudioServiceReset() {
+        // Core Audio discards every previously registered listener when its
+        // service resets, so the old tokens must not be removed or reused.
+        self.devicesListenerToken = nil
+        self.defaultInputListenerToken = nil
+        self.defaultOutputListenerToken = nil
+        self.installed = false
+        self.register()
+        self.changeTick &+= 1
+        if self.installed {
+            DebugLogger.shared.warning(
+                "Re-registered audio hardware observers after Core Audio service reset",
+                source: "AudioHardwareObserver"
+            )
+        } else {
+            DebugLogger.shared.error(
+                "Failed to re-register audio hardware observers after Core Audio service reset",
+                source: "AudioHardwareObserver"
+            )
+        }
     }
 
     deinit {
