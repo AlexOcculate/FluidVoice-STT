@@ -11,7 +11,9 @@ struct SpeakerTranscriptSegment: Identifiable, Sendable, Codable, Equatable {
     let endSeconds: Double
     let text: String
 
-    var id: String { "\(self.speaker)-\(self.startSeconds)" }
+    var id: String {
+        "\(self.speaker)-\(self.startSeconds)"
+    }
 
     enum CodingKeys: String, CodingKey {
         case speaker, startSeconds, endSeconds, text

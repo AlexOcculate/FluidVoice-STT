@@ -11,7 +11,6 @@ import XCTest
 // but the coupling should not be discovered again from scratch.
 
 final class SpeakerTurnMergingTests: XCTestCase {
-
     private typealias Turn = SpeakerDiarizationService.SpeakerTurn
 
     private func turn(_ speaker: String, _ start: Double, _ end: Double) -> Turn {

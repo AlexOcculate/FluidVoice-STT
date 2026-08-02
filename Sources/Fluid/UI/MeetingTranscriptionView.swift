@@ -189,7 +189,7 @@ struct MeetingTranscriptionView: View {
 
                                 Picker("", selection: self.$settings.fileTranscriptionExpectedSpeakerCount) {
                                     Text("Auto").tag(0)
-                                    ForEach(2 ... 8, id: \.self) { count in
+                                    ForEach(2...8, id: \.self) { count in
                                         Text("\(count)").tag(count)
                                     }
                                 }

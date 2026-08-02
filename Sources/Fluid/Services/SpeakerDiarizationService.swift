@@ -14,7 +14,9 @@ actor SpeakerDiarizationService {
         let startSeconds: Double
         let endSeconds: Double
 
-        var durationSeconds: Double { self.endSeconds - self.startSeconds }
+        var durationSeconds: Double {
+            self.endSeconds - self.startSeconds
+        }
     }
 
     private let manager: OfflineDiarizerManager
@@ -123,7 +125,9 @@ actor SpeakerDiarizationService {
         let startSeconds: Double
         let endSeconds: Double
 
-        var durationSeconds: Double { self.endSeconds - self.startSeconds }
+        var durationSeconds: Double {
+            self.endSeconds - self.startSeconds
+        }
     }
 
     init(expectedSpeakers: Int? = nil) {}
