@@ -699,96 +699,21 @@ final class MeetingTranscriptionService: ObservableObject {
 
     // MARK: - Audio Resampling Helpers
 
-    /// Resample an audio buffer to 16kHz mono Float32 samples
-    /// - Parameters:
-    ///   - buffer: Source audio buffer
-    ///   - targetSampleRate: Target sample rate (default 16000 Hz)
-    /// - Returns: Array of Float32 samples at target sample rate
-    private nonisolated func resampleBuffer(_ buffer: AVAudioPCMBuffer, targetSampleRate: Double = 16_000) throws -> [Float] {
-        let sourceFormat = buffer.format
-        let sourceSampleRate = sourceFormat.sampleRate
-        let sourceChannels = sourceFormat.channelCount
-
-        // Create target format (16kHz mono Float32)
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: targetSampleRate,
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw NSError(
-                domain: "MeetingTranscriptionService",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Could not create target audio format"]
-            )
-        }
-
-        // If already in correct format, just extract samples
-        // Must also verify the format is Float32 - if source is Float64, floatChannelData returns nil
-        if sourceSampleRate == targetSampleRate,
-           sourceChannels == 1,
-           sourceFormat.commonFormat == .pcmFormatFloat32
-        {
-            guard let channelData = buffer.floatChannelData else {
-                throw NSError(
-                    domain: "MeetingTranscriptionService",
-                    code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "Could not access audio channel data"]
-                )
-            }
-            let frameLength = Int(buffer.frameLength)
-            return Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
-        }
-
-        // Create converter
-        guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
-            throw NSError(
-                domain: "MeetingTranscriptionService",
-                code: -3,
-                userInfo: [NSLocalizedDescriptionKey: "Could not create audio converter"]
-            )
-        }
-
-        // Calculate output buffer size
-        let ratio = targetSampleRate / sourceSampleRate
-        let estimatedFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * ratio)
-
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: estimatedFrameCount + 1024) else {
-            throw NSError(
-                domain: "MeetingTranscriptionService",
-                code: -4,
-                userInfo: [NSLocalizedDescriptionKey: "Could not create output buffer"]
-            )
-        }
-
-        // Convert
-        var error: NSError?
-        var inputConsumed = false
-
-        converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-            if inputConsumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            inputConsumed = true
-            outStatus.pointee = .haveData
-            return buffer
-        }
-
-        if let error = error {
-            throw error
-        }
-
-        // Extract samples
-        guard let channelData = outputBuffer.floatChannelData else {
-            throw NSError(
-                domain: "MeetingTranscriptionService",
-                code: -5,
-                userInfo: [NSLocalizedDescriptionKey: "Could not access converted audio data"]
-            )
-        }
-
-        let frameLength = Int(outputBuffer.frameLength)
-        return Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
+    /// Resample an audio buffer to 16 kHz mono Float32 samples.
+    ///
+    /// Delegates to `AudioBufferConverter`, which is the tested implementation and the one the
+    /// standard file-transcription path already uses. The copy that used to live here built its
+    /// own `AVAudioConverter` and never set `downmix`, so a multi-channel source was
+    /// channel-mapped rather than mixed: **only the left channel was transcribed and the right
+    /// one silently discarded.** Verified by feeding a stereo file with different speech on each
+    /// channel — the transcript contained only the left one, and swapping the channels swapped
+    /// the output. After the fix both orderings produce identical output, which is what mixing
+    /// means. Stereo sources are common: in one real-world archive of 164 recordings, 72 were
+    /// stereo.
+    private nonisolated func resampleBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        targetSampleRate: Double = 16_000
+    ) throws -> [Float] {
+        try AudioBufferConverter.monoSamples(from: buffer, targetSampleRate: targetSampleRate)
     }
 }
