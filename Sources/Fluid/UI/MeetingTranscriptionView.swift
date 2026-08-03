@@ -34,6 +34,11 @@ struct MeetingTranscriptionView: View {
         }
     }
 
+    private var selectedFileIsVideo: Bool {
+        guard let fileExtension = selectedFileURL?.pathExtension.lowercased() else { return false }
+        return UTType(filenameExtension: fileExtension)?.conforms(to: .movie) ?? false
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -173,14 +178,17 @@ struct MeetingTranscriptionView: View {
                                 Text("Label speakers")
                                     .font(.subheadline)
 
-                                Text("Identify who said what (downloads speaker models on first use)")
+                                Text(self.selectedFileIsVideo
+                                    ? "Available for audio files only"
+                                    : "Identify who said what (downloads speaker models on first use)")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
                         }
                         .toggleStyle(.switch)
+                        .disabled(self.selectedFileIsVideo)
 
-                        if self.settings.fileTranscriptionSpeakerLabelsEnabled {
+                        if self.settings.fileTranscriptionSpeakerLabelsEnabled, !self.selectedFileIsVideo {
                             HStack {
                                 Text("Number of speakers")
                                     .font(.subheadline)
@@ -352,6 +360,12 @@ struct MeetingTranscriptionView: View {
                     .help("Export transcription")
                 }
                 .buttonStyle(.borderless)
+            }
+
+            if let notice = transcriptionService.fallbackNotice {
+                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
 
             Divider()

@@ -3,12 +3,9 @@ import XCTest
 
 #if arch(arm64)
 
-// `mergeAdjacentTurns` joins consecutive turns of the *same* speaker across short pauses.
-// That is correct behaviour, but it has a consequence worth pinning down: when clustering
-// collapses and every turn carries the same label, the merge happily welds question and
-// answer into one segment. The mangled segment boundaries seen on 2026-07-27 were that
-// artifact, not a separate defect in the segmentation — so nothing here needs "fixing",
-// but the coupling should not be discovered again from scratch.
+// `mergeAdjacentTurns` joins consecutive turns from the same speaker across short pauses.
+// When clustering collapses to one label, that intentionally produces one longer segment;
+// the tests below pin down both the merge rules and that interaction.
 
 final class SpeakerTurnMergingTests: XCTestCase {
     private typealias Turn = SpeakerDiarizationService.SpeakerTurn
@@ -78,7 +75,7 @@ final class SpeakerTurnMergingTests: XCTestCase {
             self.turn($0.offset % 2 == 0 ? "Speaker 1" : "Speaker 2", $0.element.0, $0.element.1)
         }
         let kept = SpeakerDiarizationService.mergeAdjacentTurns(alternating)
-        XCTAssertEqual(kept.count, 5, "correct labels keep the exchange apart — no segmentation fix needed")
+        XCTAssertEqual(kept.count, 5, "correct labels keep the exchange separated")
     }
 
     func testOverlongRunIsCappedNotMergedIndefinitely() {

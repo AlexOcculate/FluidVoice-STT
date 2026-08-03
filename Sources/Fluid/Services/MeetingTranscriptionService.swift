@@ -91,6 +91,7 @@ final class MeetingTranscriptionService: ObservableObject {
     @Published var currentStatus: String = ""
     @Published var error: String?
     @Published var result: TranscriptionResult?
+    @Published var fallbackNotice: String?
 
     // MARK: - Supported Formats
 
@@ -185,6 +186,7 @@ final class MeetingTranscriptionService: ObservableObject {
     func transcribeFile(_ fileURL: URL) async throws -> TranscriptionResult {
         self.isTranscribing = true
         error = nil
+        self.fallbackNotice = nil
         self.progress = 0.0
         let startTime = Date()
 
@@ -233,7 +235,10 @@ final class MeetingTranscriptionService: ObservableObject {
 
             // Speaker-labeled path: diarize first, then transcribe each speaker turn.
             // Any diarization failure falls back to the standard paths below.
-            if SettingsStore.shared.fileTranscriptionSpeakerLabelsEnabled, SpeakerDiarizationService.isSupported {
+            if SettingsStore.shared.fileTranscriptionSpeakerLabelsEnabled,
+               SpeakerDiarizationService.isSupported,
+               !isVideoContainer
+            {
                 if let labeledResult = await self.transcribeFileWithSpeakerLabels(
                     fileURL,
                     provider: provider,
@@ -244,6 +249,13 @@ final class MeetingTranscriptionService: ObservableObject {
                 }
                 DebugLogger.shared.warning(
                     "Speaker labeling unavailable for this file; falling back to standard transcription",
+                    source: "MeetingTranscriptionService"
+                )
+                self.fallbackNotice = "Speaker labeling was unavailable for this file. The transcript was completed without speaker labels."
+                self.progress = 0.3
+            } else if SettingsStore.shared.fileTranscriptionSpeakerLabelsEnabled, isVideoContainer {
+                DebugLogger.shared.info(
+                    "Speaker labeling skipped for video container; using standard transcription",
                     source: "MeetingTranscriptionService"
                 )
             }
@@ -471,6 +483,7 @@ final class MeetingTranscriptionService: ObservableObject {
     func reset() {
         self.result = nil
         self.error = nil
+        self.fallbackNotice = nil
         self.currentStatus = ""
         self.progress = 0.0
     }
@@ -601,9 +614,8 @@ final class MeetingTranscriptionService: ObservableObject {
         return result
     }
 
-    /// Transcribe a single speaker turn, splitting overlong turns into model-sized chunks so a
-    /// long single-speaker stretch never exceeds the ASR input limit (mirrors the standard
-    /// path's 20-minute chunking). Returns the concatenated text and mean confidence, or nil
+    /// Transcribe a single speaker turn, splitting overlong turns into bounded chunks.
+    /// Returns the concatenated text and mean confidence, or nil
     /// when the turn holds no usable audio (too short or silent). Throws on a genuine audio-read
     /// or ASR failure so the caller can fall back to full-file transcription rather than emit a
     /// transcript with silent gaps.
@@ -612,7 +624,8 @@ final class MeetingTranscriptionService: ObservableObject {
         from audioFile: AVAudioFile,
         provider: TranscriptionProvider
     ) async throws -> (text: String, confidence: Float)? {
-        // Keep each ASR request well under the model's input limit, matching the standard path.
+        // Bound memory for unusually long single-speaker stretches. Providers remain free to
+        // apply their own model-specific, energy-aware chunking within each request.
         let maxChunkSeconds: Double = 20 * 60
 
         var ranges: [(start: Double, end: Double)] = []
@@ -701,17 +714,7 @@ final class MeetingTranscriptionService: ObservableObject {
 
     // MARK: - Audio Resampling Helpers
 
-    /// Resample an audio buffer to 16 kHz mono Float32 samples.
-    ///
-    /// Delegates to `AudioBufferConverter`, which is the tested implementation and the one the
-    /// standard file-transcription path already uses. The copy that used to live here built its
-    /// own `AVAudioConverter` and never set `downmix`, so a multi-channel source was
-    /// channel-mapped rather than mixed: **only the left channel was transcribed and the right
-    /// one silently discarded.** Verified by feeding a stereo file with different speech on each
-    /// channel — the transcript contained only the left one, and swapping the channels swapped
-    /// the output. After the fix both orderings produce identical output, which is what mixing
-    /// means. Stereo sources are common: in one real-world archive of 164 recordings, 72 were
-    /// stereo.
+    /// Resample an audio buffer to 16 kHz mono Float32 samples using the shared downmixer.
     private nonisolated func resampleBuffer(
         _ buffer: AVAudioPCMBuffer,
         targetSampleRate: Double = 16_000
