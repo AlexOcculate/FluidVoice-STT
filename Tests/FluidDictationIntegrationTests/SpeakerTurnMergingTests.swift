@@ -93,4 +93,28 @@ final class SpeakerTurnMergingTests: XCTestCase {
     }
 }
 
+final class SpeakerTranscriptSegmentTests: XCTestCase {
+    func testPlainTextIncludesMinuteTimestamp() {
+        let segment = SpeakerTranscriptSegment(
+            speaker: "Speaker 1",
+            startSeconds: 65.9,
+            endSeconds: 70,
+            text: "Hello"
+        )
+
+        XCTAssertEqual(segment.plainText, "[1:05] Speaker 1: Hello")
+    }
+
+    func testPlainTextIncludesHourTimestamp() {
+        let segment = SpeakerTranscriptSegment(
+            speaker: "Speaker 2",
+            startSeconds: 3_661,
+            endSeconds: 3_670,
+            text: "Still here"
+        )
+
+        XCTAssertEqual(segment.plainText, "[1:01:01] Speaker 2: Still here")
+    }
+}
+
 #endif

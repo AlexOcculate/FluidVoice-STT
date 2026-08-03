@@ -382,7 +382,7 @@ struct MeetingTranscriptionView: View {
                                         .fontWeight(.semibold)
                                         .foregroundColor(Color.fluidGreen)
 
-                                    Text(Self.timestampString(segment.startSeconds))
+                                    Text(segment.timestampText)
                                         .font(.caption2)
                                         .foregroundColor(.secondary)
                                 }
@@ -670,18 +670,6 @@ struct MeetingTranscriptionView: View {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: fileSize)
-    }
-
-    /// Format seconds as m:ss (or h:mm:ss for long files) for speaker segment timestamps.
-    private static func timestampString(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded(.down))
-        let hours = total / 3600
-        let minutes = (total % 3600) / 60
-        let secs = total % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, secs)
-        }
-        return String(format: "%d:%02d", minutes, secs)
     }
 
     private func copyToClipboard(_ text: String) {
