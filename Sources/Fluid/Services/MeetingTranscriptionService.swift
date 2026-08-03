@@ -659,11 +659,11 @@ final class MeetingTranscriptionService: ObservableObject {
                 minimumDurationSeconds: 1.1
             )
             // Mirror the standard path's 1-second ASR minimum.
-            guard samples.count >= 16_000 else { continue }
+            guard samples.count >= 16_000 else { return nil }
 
             let chunkResult = try await provider.transcribe(samples)
             let text = chunkResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            guard !text.isEmpty else { return nil }
 
             pieces.append(text)
             confidenceSum += chunkResult.confidence
