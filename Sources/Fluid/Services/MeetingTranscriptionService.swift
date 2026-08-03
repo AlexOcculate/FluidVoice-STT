@@ -559,8 +559,15 @@ final class MeetingTranscriptionService: ObservableObject {
                 return nil
             }
 
-            // No usable audio in this turn (too short or silent) — skip without losing content.
-            guard let transcribed else { continue }
+            // An empty result would omit this turn's time range. Fall back to the complete
+            // full-file transcript rather than persist a labeled transcript with a silent gap.
+            guard let transcribed else {
+                DebugLogger.shared.warning(
+                    "Speaker segment \(index + 1)/\(turns.count) produced no text; falling back to standard transcription",
+                    source: "MeetingTranscriptionService"
+                )
+                return nil
+            }
 
             segments.append(SpeakerTranscriptSegment(
                 speaker: turn.speakerLabel,
