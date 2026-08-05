@@ -251,7 +251,9 @@ struct ContentView: View {
     @State private var visualizerNoiseThreshold: Double = SettingsStore.shared.visualizerNoiseThreshold
     @State private var inputDevices: [AudioDevice.Device] = []
     @State private var outputDevices: [AudioDevice.Device] = []
-    @State private var selectedInputUID: String = AudioDevice.getDefaultInputDevice()?.uid ?? ""
+    // Populated by gated audio initialization; querying Core Audio while SwiftUI
+    // constructs this view can race AttributeGraph metadata processing.
+    @State private var selectedInputUID: String = ""
     @State private var selectedOutputUID: String = SettingsStore.shared.preferredOutputDeviceUID ?? ""
     @State private var microphoneSelectionMode: SettingsStore.MicrophoneSelectionMode = SettingsStore.shared.microphoneSelectionMode
 
@@ -557,6 +559,10 @@ struct ContentView: View {
         self.appear = true
         self.refreshAccessibilityPermissionState()
 
+        Task {
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+        }
+
         self.handleMenuBarNavigation(self.menuBarManager.requestedNavigationDestination)
         if UserDefaults.standard.bool(forKey: self.accessibilityRestartFlagKey) {
             UserDefaults.standard.set(false, forKey: self.accessibilityRestartFlagKey)
@@ -597,38 +603,43 @@ struct ContentView: View {
             DebugLogger.shared.info("🚦 Startup delay complete, signaling UI ready...", source: "ContentView")
             self.appServices.signalUIReady()
 
-            DebugLogger.shared.info("🔊 Starting delayed audio initialization...", source: "ContentView")
-            self.audioObserver.startObserving()
-            self.asr.initialize()
-            self.menuBarManager.configure(asrService: self.appServices.asr)
-            self.refreshDevices()
+            Task { @MainActor in
+                await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+                await AudioStartupGate.shared.waitUntilOpen()
 
-            switch SettingsStore.shared.microphoneSelectionMode {
-            case .system:
-                if let defaultUID = AudioDevice.getDefaultInputDevice()?.uid {
-                    self.selectedInputUID = defaultUID
+                DebugLogger.shared.info("🔊 Starting gated audio initialization...", source: "ContentView")
+                self.audioObserver.startObserving()
+                await self.asr.initialize()
+                self.menuBarManager.configure(asrService: self.appServices.asr)
+                self.refreshDevices()
+
+                switch SettingsStore.shared.microphoneSelectionMode {
+                case .system:
+                    if let defaultUID = AudioDevice.getDefaultInputDevice()?.uid {
+                        self.selectedInputUID = defaultUID
+                    }
+                case .manual:
+                    if let preferredUID = SettingsStore.shared.preferredInputDeviceUID, !preferredUID.isEmpty {
+                        self.selectedInputUID = preferredUID
+                    } else if let defaultUID = AudioDevice.getDefaultInputDevice()?.uid {
+                        self.selectedInputUID = defaultUID
+                        SettingsStore.shared.preferredInputDeviceUID = defaultUID
+                    }
                 }
-            case .manual:
-                if let preferredUID = SettingsStore.shared.preferredInputDeviceUID, !preferredUID.isEmpty {
-                    self.selectedInputUID = preferredUID
-                } else if let defaultUID = AudioDevice.getDefaultInputDevice()?.uid {
-                    self.selectedInputUID = defaultUID
-                    SettingsStore.shared.preferredInputDeviceUID = defaultUID
+
+                if self.selectedOutputUID.isEmpty, let defOut = AudioDevice.getDefaultOutputDevice()?.uid {
+                    self.selectedOutputUID = defOut
                 }
-            }
 
-            if self.selectedOutputUID.isEmpty, let defOut = AudioDevice.getDefaultOutputDevice()?.uid {
-                self.selectedOutputUID = defOut
-            }
+                if let prefOut = SettingsStore.shared.preferredOutputDeviceUID,
+                   !prefOut.isEmpty,
+                   outputDevices.first(where: { $0.uid == prefOut }) != nil
+                {
+                    self.selectedOutputUID = prefOut
+                }
 
-            if let prefOut = SettingsStore.shared.preferredOutputDeviceUID,
-               !prefOut.isEmpty,
-               outputDevices.first(where: { $0.uid == prefOut }) != nil
-            {
-                self.selectedOutputUID = prefOut
+                DebugLogger.shared.info("✅ Audio subsystems initialized", source: "ContentView")
             }
-
-            DebugLogger.shared.info("✅ Audio subsystems initialized", source: "ContentView")
         }
     }
 
