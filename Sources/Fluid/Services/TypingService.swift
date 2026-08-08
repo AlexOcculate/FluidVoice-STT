@@ -255,6 +255,13 @@ final class TypingService {
         return nil
     }
 
+    /// Activation options used to restore focus to the external target app after dictation.
+    /// `.activateAllWindows` is intentionally omitted: raising every window of a multi-window
+    /// app (e.g. WebStorm) destroys the user's window layout on each dictation (issue #748).
+    static let focusRestoreActivationOptions: NSApplication.ActivationOptions = [
+        .activateIgnoringOtherApps,
+    ]
+
     /// Best-effort: activates the app with the given PID, unless it's Fluid itself.
     @discardableResult
     static func activateApp(pid: pid_t) -> Bool {
@@ -269,7 +276,7 @@ final class TypingService {
             return false
         }
 
-        return app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        return app.activate(options: Self.focusRestoreActivationOptions)
     }
 
     // MARK: - Public API

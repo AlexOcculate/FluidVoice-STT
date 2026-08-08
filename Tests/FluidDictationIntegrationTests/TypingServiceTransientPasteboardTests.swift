@@ -63,4 +63,20 @@ final class TypingServiceTransientPasteboardTests: XCTestCase {
             "ConcealedType signals sensitive content and must not be applied to a transcript"
         )
     }
+
+    func testFocusRestoreDoesNotRaiseAllWindowsOfTargetApp() {
+        // Issue #748: restoring focus after dictation must NOT raise every window of the
+        // target app. `.activateAllWindows` brings forward all windows of the process and
+        // destroys a multi-window layout (e.g. WebStorm) on every dictation.
+        let options = TypingService.focusRestoreActivationOptions
+
+        XCTAssertTrue(
+            options.contains(.activateIgnoringOtherApps),
+            "focus restore must still activate the target app and bring it forward"
+        )
+        XCTAssertFalse(
+            options.contains(.activateAllWindows),
+            "Restoring focus must not raise every window of the target app (issue #748)"
+        )
+    }
 }
