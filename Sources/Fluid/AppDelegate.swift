@@ -19,6 +19,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var wasLaunchedAsLoginItem = false
     private var hasDeferredMLXUpgradeOffer = false
 
+    var shouldPresentStartupMicrophoneNotice: Bool {
+        !self.wasLaunchedAsLoginItem || SettingsStore.shared.showMainWindowAtLoginLaunch
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Bring up file logging + crash handlers immediately during launch.
         _ = FileLogger.shared

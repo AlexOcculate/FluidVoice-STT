@@ -1,27 +1,47 @@
+import CoreAudio
+
 enum AudioCaptureIdlePolicy {
     static func shouldPrewarmCapture(experimentalDirectAudioCaptureEnabled: Bool) -> Bool {
         experimentalDirectAudioCaptureEnabled
     }
 
-    static func didPreferredInputAvailabilityChange(
-        preferredInputUID: String?,
+    static func didResolvedPriorityInputChange(
+        priorityInputUIDs: [String],
         previousInputUIDs: Set<String>,
         currentInputUIDs: Set<String>
     ) -> Bool {
-        guard let preferredInputUID, preferredInputUID.isEmpty == false else { return false }
-        return previousInputUIDs.contains(preferredInputUID) != currentInputUIDs.contains(preferredInputUID)
+        let previousChoice = priorityInputUIDs.first(where: previousInputUIDs.contains)
+        let currentChoice = priorityInputUIDs.first(where: currentInputUIDs.contains)
+        return previousChoice != currentChoice
+    }
+
+    static func didResolvedPriorityInputIdentityChange(
+        priorityInputUIDs: [String],
+        previousInputDeviceIDsByUID: [String: AudioObjectID],
+        currentInputDeviceIDsByUID: [String: AudioObjectID]
+    ) -> Bool {
+        let previousChoice = priorityInputUIDs.first { previousInputDeviceIDsByUID[$0] != nil }
+        let currentChoice = priorityInputUIDs.first { currentInputDeviceIDsByUID[$0] != nil }
+        guard previousChoice == currentChoice else { return true }
+        guard let currentChoice else { return false }
+        return previousInputDeviceIDsByUID[currentChoice] != currentInputDeviceIDsByUID[currentChoice]
     }
 
     static func shouldReconcileInputSelection(
-        preferredInputUID: String?,
+        priorityInputUIDs: [String],
         migrationPending: Bool,
         previousInputUIDs: Set<String>,
         currentInputUIDs: Set<String>
     ) -> Bool {
-        guard currentInputUIDs.isEmpty == false else { return false }
-        let needsInitialSelection = preferredInputUID?.isEmpty ?? true
-        return migrationPending || needsInitialSelection || self.didPreferredInputAvailabilityChange(
-            preferredInputUID: preferredInputUID,
+        if currentInputUIDs.isEmpty {
+            return previousInputUIDs.isEmpty == false && self.didResolvedPriorityInputChange(
+                priorityInputUIDs: priorityInputUIDs,
+                previousInputUIDs: previousInputUIDs,
+                currentInputUIDs: currentInputUIDs
+            )
+        }
+        return migrationPending || priorityInputUIDs.isEmpty || self.didResolvedPriorityInputChange(
+            priorityInputUIDs: priorityInputUIDs,
             previousInputUIDs: previousInputUIDs,
             currentInputUIDs: currentInputUIDs
         )

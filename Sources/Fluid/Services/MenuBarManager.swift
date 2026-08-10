@@ -5,6 +5,7 @@ import SwiftUI
 
 enum MenuBarNavigationDestination: String {
     case customDictionary
+    case microphoneSettings
     case preferences
 }
 
@@ -25,6 +26,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     // References to app state
     private weak var asrService: ASRService?
     private var cancellables = Set<AnyCancellable>()
+    private var configuredASRIdentifier: ObjectIdentifier?
 
     /// Overlay management (persistent, independent of window lifecycle)
     private var overlayVisible: Bool = false
@@ -37,8 +39,9 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     @Published var isRecording: Bool = false
 
     /// One-shot navigation requests from the menu bar into the main window UI.
-    /// `ContentView` consumes this and clears it.
+    /// The manager clears each generation after the front-most view has handled it.
     @Published var requestedNavigationDestination: MenuBarNavigationDestination? = nil
+    private var navigationRequestGeneration: UInt64 = 0
 
     /// Track current overlay mode for notch
     private var currentOverlayMode: OverlayMode = .dictation
@@ -56,6 +59,16 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     /// Subscription for forwarding audio levels to expanded command notch
     private var expandedModeAudioSubscription: AnyCancellable?
 
+    override init() {
+        super.init()
+        NotificationCenter.default.publisher(for: .openMicrophoneSettingsRequested)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.openMicrophoneSettingsFromUI()
+            }
+            .store(in: &self.cancellables)
+    }
+
     func initializeMenuBar() {
         guard !self.isSetup else { return }
 
@@ -70,6 +83,9 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     func configure(asrService: ASRService) {
+        let identifier = ObjectIdentifier(asrService)
+        guard self.configuredASRIdentifier != identifier else { return }
+        self.configuredASRIdentifier = identifier
         self.asrService = asrService
         if SettingsStore.shared.overlayPosition == .bottom {
             DispatchQueue.main.async {
@@ -590,8 +606,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         loadingItem.isEnabled = false
         submenu.addItem(loadingItem)
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let inputDevices = AudioDevice.listInputDevices()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let inputDevices = AudioDevice.listInputDevicesRefreshingLiveness()
             let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
 
             DispatchQueue.main.async { [weak self] in
@@ -616,18 +632,40 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             return
         }
 
-        let currentUID = AppServices.shared.microphonePreferenceCoordinator
-            .inputDeviceForCapture(
-                availableInputs: inputDevices,
-                defaultInputUID: defaultInputUID
-            )?.uid
+        let microphonePreferenceCoordinator = AppServices.shared.microphonePreferenceCoordinator
+        let currentUID = microphonePreferenceCoordinator.reconcileMicrophoneSelection(
+            availableInputs: inputDevices,
+            defaultInputUID: defaultInputUID
+        )?.uid
 
-        for device in inputDevices {
-            let isSystemDefault = device.uid == defaultInputUID
-            let title = isSystemDefault ? "\(device.name) (System Default)" : device.name
+        guard SettingsStore.shared.microphonePriority.isEmpty == false else {
+            let emptyItem = NSMenuItem(title: "No microphones in priority", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            submenu.addItem(emptyItem)
+            return
+        }
+
+        let devicesByUID = Dictionary(
+            inputDevices.map { ($0.uid, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        for (index, entry) in SettingsStore.shared.microphonePriority.enumerated() {
+            guard let device = devicesByUID[entry.uid],
+                  microphonePreferenceCoordinator.isInputDeviceAvailable(device)
+            else {
+                let item = NSMenuItem(
+                    title: "\(index + 1). \(entry.name) (Unavailable)",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                item.isEnabled = false
+                submenu.addItem(item)
+                continue
+            }
+            let title = "\(index + 1). \(device.name)"
             let item = NSMenuItem(title: title, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = device.uid
+            item.representedObject = device
             item.state = device.uid == currentUID ? .on : .off
             item.isEnabled = !self.isRecording
             submenu.addItem(item)
@@ -659,9 +697,9 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
     @objc private func selectMicrophone(_ sender: NSMenuItem) {
         guard self.isRecording == false else { return }
-        guard let uid = sender.representedObject as? String, !uid.isEmpty else { return }
+        guard let device = sender.representedObject as? AudioDevice.Device else { return }
 
-        SettingsStore.shared.recordInputDeviceSelection(uid)
+        SettingsStore.shared.recordInputDeviceSelection(device.uid, name: device.name)
 
         self.refreshMicrophoneMenu()
     }
@@ -868,6 +906,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     private func openNavigationDestination(_ destination: MenuBarNavigationDestination) {
+        self.navigationRequestGeneration &+= 1
+        let requestGeneration = self.navigationRequestGeneration
         // Ensure a fresh one-shot request every time the menu item is clicked.
         self.requestedNavigationDestination = nil
         self.requestedNavigationDestination = destination
@@ -877,14 +917,26 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         // Nudge again after the window is front-most, so an already-open ContentView
         // will still switch tabs even if it consumed a previous navigation request.
         DispatchQueue.main.async { [weak self] in
-            self?.requestedNavigationDestination = nil
-            self?.requestedNavigationDestination = destination
+            guard let self, self.navigationRequestGeneration == requestGeneration else { return }
+            self.requestedNavigationDestination = nil
+            self.requestedNavigationDestination = destination
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self,
+                      self.navigationRequestGeneration == requestGeneration,
+                      self.requestedNavigationDestination == destination
+                else { return }
+                self.requestedNavigationDestination = nil
+            }
         }
     }
 
     /// Public entry-point for non-menu UI surfaces (e.g. overlay controls) to open Preferences.
     func openPreferencesFromUI() {
         self.openPreferences()
+    }
+
+    func openMicrophoneSettingsFromUI() {
+        self.openNavigationDestination(.microphoneSettings)
     }
 
     /// Create and present a fresh main window hosting `ContentView`

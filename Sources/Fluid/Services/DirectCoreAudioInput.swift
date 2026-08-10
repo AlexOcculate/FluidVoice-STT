@@ -751,8 +751,17 @@ final nonisolated class DirectCoreAudioLifecycleController: @unchecked Sendable 
                 switch selection {
                 case .systemDefault:
                     device = AudioDevice.getDefaultInputDevice()
+                        .flatMap { AudioDevice.isInputDeviceUsable($0) ? $0 : nil }
                 case let .preferredUID(uid):
-                    device = AudioDevice.getInputDevice(byUID: uid)
+                    if let preferredDevice = AudioDevice.getInputDevice(byUID: uid),
+                       AudioDevice.isInputDeviceUsable(preferredDevice)
+                    {
+                        device = preferredDevice
+                    } else {
+                        // Let ASRService retry the next app-priority device. Falling back
+                        // here would silently bypass the user's order during a HAL race.
+                        device = nil
+                    }
                 }
                 guard let device else {
                     continuation.resume(
