@@ -2538,6 +2538,10 @@ private final class SettingsPersistentScroller: NSScroller {
     }
 }
 
+private final class SettingsPersistentScrollCoordinator {
+    var lastMicrophoneSettingsScrollRequest = 0
+}
+
 private struct SettingsPersistentScrollView<Content: View>: NSViewRepresentable {
     private let theme: AppTheme
     private let colorScheme: ColorScheme
@@ -2556,8 +2560,8 @@ private struct SettingsPersistentScrollView<Content: View>: NSViewRepresentable 
         self.content = content()
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
+    func makeCoordinator() -> SettingsPersistentScrollCoordinator {
+        SettingsPersistentScrollCoordinator()
     }
 
     private var hostedContent: AnyView {
@@ -2630,10 +2634,6 @@ private struct SettingsPersistentScrollView<Content: View>: NSViewRepresentable 
         let targetY = min(maximumY, max(0, targetRect.minY - 12))
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
-    }
-
-    final class Coordinator {
-        var lastMicrophoneSettingsScrollRequest = 0
     }
 }
 
