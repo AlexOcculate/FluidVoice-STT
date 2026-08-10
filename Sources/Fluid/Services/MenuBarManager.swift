@@ -633,11 +633,10 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         }
 
         let microphonePreferenceCoordinator = AppServices.shared.microphonePreferenceCoordinator
-        microphonePreferenceCoordinator.reconcileMicrophoneSelection(
+        let currentUID = microphonePreferenceCoordinator.reconcileMicrophoneSelection(
             availableInputs: inputDevices,
             defaultInputUID: defaultInputUID
-        )
-        let currentUID = microphonePreferenceCoordinator.confirmedActiveInputUID
+        )?.uid
 
         guard SettingsStore.shared.microphonePriority.isEmpty == false else {
             let emptyItem = NSMenuItem(title: "No microphones in priority", action: nil, keyEquivalent: "")
