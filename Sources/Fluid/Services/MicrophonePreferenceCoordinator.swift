@@ -87,13 +87,24 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
         let enumeratedPreferredInput = availableInputs.first { input in
             input.uid == self.settings.preferredInputDeviceUID
         }
+        let enumeratedDefaultInput = defaultInputUID.flatMap { uid in
+            availableInputs.first { $0.uid == uid }
+        }
         let defaultInput = defaultInputUID.flatMap { uid in
             usableInputs.first { $0.uid == uid }
         }
-        let migrationInputs = defaultInput.map { input in
+        let migrationInputs = enumeratedDefaultInput.map { input in
             [input] + availableInputs.filter { $0.uid != input.uid }
         } ?? availableInputs
         let previousMode = self.settings.storedMicSelectionModeForMigration
+        let hasStoredMode = self.settings.hasStoredMicSelectionModeForMigration
+        let preserveLegacyStoredSelection =
+            migrationVersion == 0 &&
+            hasStoredMode == false &&
+            self.settings.preferredInputDeviceUID?.isEmpty == false &&
+            self.settings.suppressedMicrophoneUIDs.contains(
+                self.settings.preferredInputDeviceUID ?? ""
+            ) == false
         if migrationVersion >= 2,
            let preferredUID = self.settings.preferredInputDeviceUID,
            preferredUID.isEmpty == false
@@ -112,7 +123,9 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
             enumeratedPreferredInput?.isBuiltIn != true &&
             Self.isLikelyBuiltInMicrophoneUID(self.settings.preferredInputDeviceUID) == false
         if preferredInput == nil,
-           preserveDisconnectedManualSelection || preserveDisconnectedVersionOneExternal,
+           preserveDisconnectedManualSelection ||
+           preserveDisconnectedVersionOneExternal ||
+           preserveLegacyStoredSelection,
            let preferredUID = self.settings.preferredInputDeviceUID,
            preferredUID.isEmpty == false
         {
@@ -132,10 +145,16 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
             selectedInput = preferredInput
                 ?? defaultInput
                 ?? self.fallbackInput(from: usableInputs, defaultInputUID: defaultInputUID)
-        } else if migrationVersion == 0 {
-            selectedInput = defaultInput
-                ?? preferredInput
+        } else if preserveLegacyStoredSelection {
+            selectedInput = preferredInput
+                ?? defaultInput
                 ?? self.fallbackInput(from: usableInputs, defaultInputUID: defaultInputUID)
+        } else if migrationVersion == 0 {
+            // A fresh install must mirror macOS's selected input, not permanently
+            // promote whichever fallback happened to enumerate first at launch.
+            // If HAL has not exposed the default yet, leave migration pending;
+            // capture can still use a temporary fallback without saving it.
+            selectedInput = enumeratedDefaultInput
         } else if migrationVersion == 1,
                   let preferredInput,
                   preferredInput.isBuiltIn,
@@ -151,6 +170,18 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
                 ?? self.fallbackInput(from: usableInputs, defaultInputUID: defaultInputUID)
         }
         guard let selectedInput else {
+            if migrationVersion == 0,
+               previousMode == .system
+            {
+                // Keep the visible priority list and removal bookkeeping useful
+                // while HAL has not exposed its default input yet. Migration stays
+                // pending, so a later default-input event can still promote the
+                // actual macOS selection to first place.
+                let preferredUIDBeforePendingReconciliation = self.settings.preferredInputDeviceUID
+                self.settings.reconcileMicrophonePriority(with: availableInputs)
+                self.settings.preferredInputDeviceUID = preferredUIDBeforePendingReconciliation
+                return
+            }
             self.settings.reconcileMicrophonePriority(with: migrationInputs)
             return
         }
@@ -194,6 +225,10 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
         let previousName = self.lastResolvedInputName
         self.lastResolvedInputUID = uid
         self.lastResolvedInputName = name
+
+        // Onboarding owns microphone feedback inside its setup panel. A global
+        // floating notice here would cover that flow and duplicate the picker.
+        guard self.settings.shouldShowOnboarding == false else { return }
 
         guard previousUID != nil, uid != previousUID else {
             if self.startupNoticeEligibilityEnabled {
