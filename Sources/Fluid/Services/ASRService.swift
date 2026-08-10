@@ -1642,11 +1642,11 @@ final class ASRService: ObservableObject {
         self.audioLevelSubject.send(0)
     }
 
-    private func handOffMicrophonePreviewToCaptureStartIfNeeded() {
+    private func handOffMicrophonePreviewToCaptureStartIfNeeded() -> Bool {
         guard self.isMicrophonePreviewRequested ||
             self.isMicrophonePreviewActive ||
             self.audioCapturePipeline.isLevelMonitoringEnabled
-        else { return }
+        else { return false }
 
         // Invalidate preview ownership without stopping Core Audio. The direct
         // lifecycle serializes any in-flight preview start, and recording can
@@ -1656,6 +1656,17 @@ final class ASRService: ObservableObject {
         self.audioCapturePipeline.setLevelMonitoringEnabled(false)
         self.isMicrophonePreviewActive = false
         self.microphonePreviewError = nil
+        self.audioLevelSubject.send(0)
+        return true
+    }
+
+    private func stopHandedOffMicrophonePreviewAfterCancelledStart() async {
+        self.audioCapturePipeline.setRecordingEnabled(false)
+        _ = await self.directAudioLifecycleController.stop(
+            retainPrepared: true,
+            reason: "cancelled_microphone_preview_handoff"
+        )
+        self.activeAudioCaptureBackend = .none
         self.audioLevelSubject.send(0)
     }
 
@@ -1712,7 +1723,7 @@ final class ASRService: ObservableObject {
         // Reserve the start before relinquishing preview ownership so a
         // press-and-hold release can cancel the handoff. Keep the running input
         // alive; startConfiguredAudioCapture reuses it for zero-stop first PCM.
-        self.handOffMicrophonePreviewToCaptureStartIfNeeded()
+        let handedOffMicrophonePreview = self.handOffMicrophonePreviewToCaptureStartIfNeeded()
 
         // Reset media pause state for this session
         self.didPauseMediaForThisSession = false
@@ -1722,6 +1733,9 @@ final class ASRService: ObservableObject {
         guard startGeneration == self.audioCaptureStartGeneration,
               self.isTerminating == false
         else {
+            if handedOffMicrophonePreview {
+                await self.stopHandedOffMicrophonePreviewAfterCancelledStart()
+            }
             DebugLogger.shared.debug(
                 "Audio capture start cancelled during route handoff generation=\(startGeneration)",
                 source: "ASRService"
