@@ -1081,6 +1081,7 @@ final class ASRService: ObservableObject {
 
     private var inputFormat: AVAudioFormat?
     private var micPermissionGranted = false
+    private var isRequestingMicrophoneAccess = false
 
     // Internal access for MeetingTranscriptionService to share models
     // Note: Only available when using FluidAudioProvider (Apple Silicon)
@@ -1476,18 +1477,31 @@ final class ASRService: ObservableObject {
     }
 
     func requestMicAccess() {
-        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            guard let self = self else { return }
-            Task { @MainActor in
-                self.micPermissionGranted = granted
-                self.micStatus = granted ? .authorized : .denied
-                if granted {
-                    AppServices.shared.microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
-                        microphoneAuthorized: true,
-                        launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
-                            .shouldPresentStartupMicrophoneNotice ?? true
-                    )
-                    await self.prewarmConfiguredAudioCaptureIfPossible(reason: "permission_granted")
+        guard self.isRequestingMicrophoneAccess == false else { return }
+        self.isRequestingMicrophoneAccess = true
+        Task { @MainActor [weak self] in
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+            await AudioStartupGate.shared.waitUntilOpen()
+            guard let self else { return }
+            guard self.isTerminating == false else {
+                self.isRequestingMicrophoneAccess = false
+                return
+            }
+
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                guard let self else { return }
+                Task { @MainActor in
+                    self.isRequestingMicrophoneAccess = false
+                    self.micPermissionGranted = granted
+                    self.micStatus = granted ? .authorized : .denied
+                    if granted {
+                        AppServices.shared.microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
+                            microphoneAuthorized: true,
+                            launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
+                                .shouldPresentStartupMicrophoneNotice ?? true
+                        )
+                        await self.prewarmConfiguredAudioCaptureIfPossible(reason: "permission_granted")
+                    }
                 }
             }
         }

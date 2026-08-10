@@ -392,13 +392,10 @@ struct WelcomeView: View {
             }
         }
         .onAppear {
-            // CRITICAL FIX: Refresh microphone and model status immediately on appear
-            // This prevents the Quick Setup from showing stale status before ASRService.initialize() runs
             Task { @MainActor in
-                // Check microphone status without triggering the full initialize() delay
+                await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+                await AudioStartupGate.shared.waitUntilOpen()
                 self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-
-                // Check if models exist on disk (async for accurate detection with AppleSpeechAnalyzerProvider)
                 await self.asr.checkIfModelsExistAsync()
             }
         }
@@ -948,13 +945,7 @@ struct OnboardingFlowView: View {
             self.isOnboardingFlowVisible = true
             self.syncOnboardingSelectionFromSettings()
             self.playLandingWelcomeSoundIfNeeded()
-            Task { @MainActor in
-                self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-                if self.step == .permissions, self.isMicrophoneReady {
-                    self.refreshOnboardingMicrophones(startPreview: true)
-                }
-                await self.asr.checkIfModelsExistAsync()
-            }
+            self.refreshOnboardingMicrophoneAuthorization(checkModels: true)
         }
         .onChange(of: self.currentStep) { _, _ in
             if self.step != .voiceModel {
@@ -1020,10 +1011,7 @@ struct OnboardingFlowView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             self.syncOnboardingSelectionFromSettings()
-            self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-            if self.step == .permissions, self.isMicrophoneReady {
-                self.refreshOnboardingMicrophones(startPreview: true)
-            }
+            self.refreshOnboardingMicrophoneAuthorization()
         }
     }
 
@@ -1146,8 +1134,16 @@ struct OnboardingFlowView: View {
 
     private func playLandingWelcomeSoundIfNeeded() {
         guard self.step == .landing, !self.hasPlayedLandingWelcomeSound else { return }
-        self.hasPlayedLandingWelcomeSound = true
-        OnboardingSoundPlayer.shared.playWelcomeSound()
+        Task { @MainActor in
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+            await AudioStartupGate.shared.waitUntilOpen()
+            guard self.isOnboardingFlowVisible,
+                  self.step == .landing,
+                  self.hasPlayedLandingWelcomeSound == false
+            else { return }
+            self.hasPlayedLandingWelcomeSound = true
+            OnboardingSoundPlayer.shared.playWelcomeSound()
+        }
     }
 
     private var languageStep: some View {
@@ -2812,36 +2808,62 @@ struct OnboardingFlowView: View {
 }
 
 private extension OnboardingFlowView {
+    func refreshOnboardingMicrophoneAuthorization(checkModels: Bool = false) {
+        Task { @MainActor in
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+            await AudioStartupGate.shared.waitUntilOpen()
+            guard self.isOnboardingFlowVisible else { return }
+
+            self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+            if self.step == .permissions, self.isMicrophoneReady {
+                self.refreshOnboardingMicrophones(startPreview: true)
+            }
+            if checkModels {
+                await self.asr.checkIfModelsExistAsync()
+            }
+        }
+    }
+
     func refreshOnboardingMicrophones(startPreview: Bool) {
         guard self.isOnboardingFlowVisible else { return }
         self.onboardingMicrophoneRefreshGeneration &+= 1
         let generation = self.onboardingMicrophoneRefreshGeneration
         let suppressedUIDs = self.settings.suppressedMicrophoneUIDs
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let inputs = AudioDevice.listInputDevicesRefreshingLiveness()
-            let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
-            let usableInputs = inputs.filter { device in
-                suppressedUIDs.contains(device.uid) == false && AudioDevice.isInputDeviceUsable(device)
-            }
+        Task { @MainActor in
+            await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
+            await AudioStartupGate.shared.waitUntilOpen()
+            guard generation == self.onboardingMicrophoneRefreshGeneration,
+                  self.isOnboardingFlowVisible,
+                  self.step == .permissions,
+                  self.isMicrophoneReady
+            else { return }
 
-            DispatchQueue.main.async {
-                guard generation == self.onboardingMicrophoneRefreshGeneration,
-                      self.isOnboardingFlowVisible,
-                      self.step == .permissions,
-                      self.isMicrophoneReady
-                else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let inputs = AudioDevice.listInputDevicesRefreshingLiveness()
+                let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
+                let usableInputs = inputs.filter { device in
+                    suppressedUIDs.contains(device.uid) == false && AudioDevice.isInputDeviceUsable(device)
+                }
 
-                let selectedInput = self.appServices.microphonePreferenceCoordinator
-                    .reconcileMicrophoneSelection(
-                        availableInputs: inputs,
-                        defaultInputUID: defaultInputUID
-                    )
-                self.onboardingInputDevices = usableInputs
-                self.selectedOnboardingInputUID = selectedInput?.uid ?? usableInputs.first?.uid ?? ""
+                DispatchQueue.main.async {
+                    guard generation == self.onboardingMicrophoneRefreshGeneration,
+                          self.isOnboardingFlowVisible,
+                          self.step == .permissions,
+                          self.isMicrophoneReady
+                    else { return }
 
-                if startPreview {
-                    self.startOnboardingMicrophonePreviewIfNeeded()
+                    let selectedInput = self.appServices.microphonePreferenceCoordinator
+                        .reconcileMicrophoneSelection(
+                            availableInputs: inputs,
+                            defaultInputUID: defaultInputUID
+                        )
+                    self.onboardingInputDevices = usableInputs
+                    self.selectedOnboardingInputUID = selectedInput?.uid ?? usableInputs.first?.uid ?? ""
+
+                    if startPreview {
+                        self.startOnboardingMicrophonePreviewIfNeeded()
+                    }
                 }
             }
         }
