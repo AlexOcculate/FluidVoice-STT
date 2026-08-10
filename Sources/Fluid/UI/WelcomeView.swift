@@ -993,7 +993,12 @@ struct OnboardingFlowView: View {
             self.stopOnboardingMicrophonePreview()
         }
         .onReceive(self.asr.audioLevelPublisher) { level in
-            guard self.step == .permissions, self.isMicrophoneReady else { return }
+            guard self.step == .permissions,
+                  self.isMicrophoneReady,
+                  self.asr.isMicrophonePreviewActive,
+                  self.asr.isRunning == false,
+                  self.asr.isStarting == false
+            else { return }
             let now = ProcessInfo.processInfo.systemUptime
             guard level == 0 || now - self.lastOnboardingMicrophoneLevelUpdate >= 0.05 else {
                 return

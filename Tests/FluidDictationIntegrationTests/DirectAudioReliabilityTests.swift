@@ -253,6 +253,42 @@ final class DirectAudioReliabilityTests: XCTestCase {
         XCTAssertEqual(recorder.maximumConcurrentOperations, 1)
     }
 
+    func testStartingRunningInputReusesHardwareWithoutStopOrRestart() async throws {
+        let fingerprint = makeFingerprint(sampleRate: 48_000, bufferFrameSize: 512)
+        let recorder = DirectAudioEventRecorder()
+        let factory = FakeDirectAudioInputFactory(
+            fingerprints: [fingerprint],
+            recorder: recorder
+        )
+        let controller = DirectCoreAudioLifecycleController(
+            packetHandler: { _, _, _, _, _ in },
+            inputFactory: { deviceID, _ in
+                try factory.make(deviceID: deviceID)
+            },
+            fingerprintReader: { _ in fingerprint },
+            installsHardwareListeners: false,
+            onFormatInvalidated: { _ in }
+        )
+
+        _ = try await controller.start(
+            deviceID: fingerprint.deviceID,
+            deviceName: "Test microphone",
+            reason: "preview"
+        )
+        let reused = try await controller.start(
+            deviceID: fingerprint.deviceID,
+            deviceName: "Test microphone",
+            reason: "dictation_handoff"
+        )
+        await controller.shutdown(reason: "test_complete")
+
+        XCTAssertEqual(reused.phase, .running)
+        XCTAssertEqual(
+            recorder.events,
+            ["make:48000", "start:48000", "invalidate:48000"]
+        )
+    }
+
     func testFailedStopPoisonsLifecycleAndPreventsReplacement() async throws {
         let fingerprint = makeFingerprint(sampleRate: 48_000, bufferFrameSize: 512)
         let recorder = DirectAudioEventRecorder()

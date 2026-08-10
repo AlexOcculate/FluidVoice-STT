@@ -844,6 +844,29 @@ final nonisolated class DirectCoreAudioLifecycleController: @unchecked Sendable 
                     guard let validatedInput = self.input else {
                         throw Self.error("Direct Core Audio input disappeared before start.")
                     }
+                    if validatedInput.isRunning {
+                        let runningFingerprint = try self.fingerprintReader(deviceID)
+                        guard runningFingerprint == validatedInput.formatFingerprint,
+                              validatedInput.openPacketGateIfClean()
+                        else {
+                            throw Self.error(
+                                "Direct Core Audio format changed while reusing running input generation " +
+                                    "\(self.generation)."
+                            )
+                        }
+                        self.publishSnapshot(
+                            phase: .running,
+                            input: validatedInput,
+                            fingerprint: validatedInput.formatFingerprint
+                        )
+                        Self.log(
+                            "Direct capture start reused running input generation=\(self.generation) " +
+                                "device='\(deviceName)'",
+                            level: .debug
+                        )
+                        continuation.resume(returning: self.snapshot)
+                        return
+                    }
                     self.publishSnapshot(
                         phase: .starting,
                         input: validatedInput,

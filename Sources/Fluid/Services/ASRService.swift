@@ -1528,8 +1528,12 @@ final class ASRService: ObservableObject {
                   self.isMicrophonePreviewRequested,
                   self.isRunning == false,
                   self.isStarting == false,
-                  self.isTerminating == false
-            else { return }
+                  self.isTerminating == false,
+                  Task.isCancelled == false
+            else {
+                self.abandonMicrophonePreviewRequestIfOwned(operationGeneration)
+                return
+            }
             self.activeAudioCaptureBackend = .none
             self.isMicrophonePreviewActive = false
             self.audioLevelSubject.send(0)
@@ -1542,8 +1546,12 @@ final class ASRService: ObservableObject {
               self.isMicrophonePreviewRequested,
               self.isRunning == false,
               self.isStarting == false,
-              self.isTerminating == false
-        else { return }
+              self.isTerminating == false,
+              Task.isCancelled == false
+        else {
+            self.abandonMicrophonePreviewRequestIfOwned(operationGeneration)
+            return
+        }
         self.microphonePreviewError = nil
         self.audioCapturePipeline.setLevelMonitoringEnabled(true)
 
@@ -1608,6 +1616,7 @@ final class ASRService: ObservableObject {
         self.microphonePreviewOperationGeneration &+= 1
         let operationGeneration = self.microphonePreviewOperationGeneration
         self.isMicrophonePreviewRequested = false
+        self.microphonePreviewError = nil
         guard self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled else {
             return
         }
@@ -1620,6 +1629,33 @@ final class ASRService: ObservableObject {
         guard operationGeneration == self.microphonePreviewOperationGeneration else { return }
         self.activeAudioCaptureBackend = .none
         self.isMicrophonePreviewActive = false
+        self.audioLevelSubject.send(0)
+    }
+
+    private func abandonMicrophonePreviewRequestIfOwned(_ operationGeneration: UInt64) {
+        guard operationGeneration == self.microphonePreviewOperationGeneration else { return }
+        self.isMicrophonePreviewRequested = false
+        self.audioCapturePipeline.setLevelMonitoringEnabled(false)
+        self.activeAudioCaptureBackend = .none
+        self.isMicrophonePreviewActive = false
+        self.microphonePreviewError = nil
+        self.audioLevelSubject.send(0)
+    }
+
+    private func handOffMicrophonePreviewToCaptureStartIfNeeded() {
+        guard self.isMicrophonePreviewRequested ||
+            self.isMicrophonePreviewActive ||
+            self.audioCapturePipeline.isLevelMonitoringEnabled
+        else { return }
+
+        // Invalidate preview ownership without stopping Core Audio. The direct
+        // lifecycle serializes any in-flight preview start, and recording can
+        // reuse the already-running input without losing opening PCM.
+        self.microphonePreviewOperationGeneration &+= 1
+        self.isMicrophonePreviewRequested = false
+        self.audioCapturePipeline.setLevelMonitoringEnabled(false)
+        self.isMicrophonePreviewActive = false
+        self.microphonePreviewError = nil
         self.audioLevelSubject.send(0)
     }
 
@@ -1673,20 +1709,10 @@ final class ASRService: ObservableObject {
         self.isStarting = true
         defer { self.finishAudioCaptureStart() }
 
-        // Reserve the start before preview teardown yields. Press-and-hold release
-        // must be able to see and cancel this handoff before capture hardware starts.
-        if self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled {
-            await self.stopMicrophonePreview()
-            guard startGeneration == self.audioCaptureStartGeneration,
-                  self.isTerminating == false
-            else {
-                DebugLogger.shared.debug(
-                    "Audio capture start cancelled during microphone preview handoff",
-                    source: "ASRService"
-                )
-                return .failed
-            }
-        }
+        // Reserve the start before relinquishing preview ownership so a
+        // press-and-hold release can cancel the handoff. Keep the running input
+        // alive; startConfiguredAudioCapture reuses it for zero-stop first PCM.
+        self.handOffMicrophonePreviewToCaptureStartIfNeeded()
 
         // Reset media pause state for this session
         self.didPauseMediaForThisSession = false

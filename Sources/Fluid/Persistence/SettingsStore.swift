@@ -1867,6 +1867,10 @@ final class SettingsStore: ObservableObject {
         return mode
     }
 
+    var hasStoredMicSelectionModeForMigration: Bool {
+        self.defaults.object(forKey: Keys.microphoneSelectionMode) != nil
+    }
+
     var microphoneSelectionMode: MicrophoneSelectionMode {
         get {
             guard let rawValue = self.defaults.string(forKey: Keys.microphoneSelectionMode),
