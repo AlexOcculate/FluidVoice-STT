@@ -26,7 +26,9 @@ struct SettingsView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.theme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @ObservedObject private var settings = SettingsStore.shared
+    @ObservedObject var microphonePreferenceCoordinator: MicrophonePreferenceCoordinator
     @Binding var appear: Bool
     @Binding var visualizerNoiseThreshold: Double
     @Binding var selectedInputUID: String
@@ -52,7 +54,7 @@ struct SettingsView: View {
     // CRITICAL FIX: Cache default device names to avoid CoreAudio calls during view body evaluation.
     // Querying AudioDevice.getDefaultInputDevice() in the view body triggers HALSystem::InitializeShell()
     // which races with SwiftUI's AttributeGraph metadata processing and causes EXC_BAD_ACCESS crashes.
-    @State private var cachedDefaultInputName: String = ""
+    @State private var cachedDefaultInputUID: String = ""
     @State private var cachedDefaultOutputName: String = ""
 
     // Analytics consent UI state (default ON; user can opt-out)
@@ -64,6 +66,8 @@ struct SettingsView: View {
     @State private var isRollingBack: Bool = false
     @State private var audioHistoryBudgetText: String = Self.audioBudgetText(for: SettingsStore.shared.audioHistoryBudgetGB)
     @State private var audioHistoryUsageBytes: Int64 = DictationAudioHistoryStore.shared.audioUsageBytes()
+    @State private var draggedMicrophoneUID: String?
+    @State private var hoveredMicrophoneUID: String?
 
     let hotkeyManager: GlobalHotkeyManager?
     let menuBarManager: MenuBarManager
@@ -73,25 +77,7 @@ struct SettingsView: View {
     let restartApp: () -> Void
     let revealAppInFinder: () -> Void
     let openApplicationsFolder: () -> Void
-
-    private var inputDeviceSelection: Binding<String> {
-        Binding(
-            get: { self.selectedInputUID },
-            set: { newUID in
-                guard !newUID.isEmpty else { return }
-                guard !self.asr.isRunning else {
-                    DebugLogger.shared.warning(
-                        "Cannot change input device during recording",
-                        source: "SettingsView"
-                    )
-                    return
-                }
-
-                self.selectedInputUID = newUID
-                SettingsStore.shared.recordInputDeviceSelection(newUID)
-            }
-        )
-    }
+    let microphoneSettingsScrollRequest: Int
 
     private var isRecordingAnyShortcut: Bool {
         self.activeShortcutRecordingTarget != nil
@@ -229,7 +215,11 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        SettingsPersistentScrollView(theme: self.theme, colorScheme: self.colorScheme) {
+        SettingsPersistentScrollView(
+            theme: self.theme,
+            colorScheme: self.colorScheme,
+            microphoneSettingsScrollRequest: self.microphoneSettingsScrollRequest
+        ) {
             VStack(spacing: 16) {
                 // App Settings Card
                 ThemedCard(style: .standard) {
@@ -1101,7 +1091,8 @@ struct SettingsView: View {
                             Button {
                                 self.refreshDevices()
                                 // Update cached default device names on refresh
-                                self.cachedDefaultInputName = AudioDevice.getDefaultInputDevice()?.name ?? ""
+                                let defaultInput = AudioDevice.getDefaultInputDevice()
+                                self.cachedDefaultInputUID = defaultInput?.uid ?? ""
                                 self.cachedDefaultOutputName = AudioDevice.getDefaultOutputDevice()?.name ?? ""
                             } label: {
                                 Label("Refresh", systemImage: "arrow.clockwise")
@@ -1110,41 +1101,21 @@ struct SettingsView: View {
                             .controlSize(.small)
                         }
 
-                        self.microphoneModeInfo
-
                         VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                Text("Input Device")
-                                    .font(self.theme.typography.bodyStrong)
-                                    .foregroundStyle(self.settingsTitleText)
-                                Spacer()
-                                Picker("", selection: self.inputDeviceSelection) {
-                                    // Handle empty state gracefully
-                                    if self.inputDevices.isEmpty {
-                                        Text("Loading...").tag("")
-                                    } else {
-                                        ForEach(self.inputDevices, id: \.uid) { dev in
-                                            Text(self.inputDeviceTitle(dev)).tag(dev.uid)
-                                        }
-                                    }
-                                }
-                                .pickerStyle(.menu)
-                                .frame(width: 240)
-                                .disabled(self.asr.isRunning)
-                                // Sync selection when devices load or change
+                            self.microphonePrioritySection
                                 .onChange(of: self.inputDevices) { _, newDevices in
-                                    // Update cached default device name when device list changes
-                                    self.cachedDefaultInputName = AudioDevice.getDefaultInputDevice()?.name ?? ""
-
-                                    guard !newDevices.isEmpty else { return }
-
+                                    let defaultInput = AudioDevice.getDefaultInputDevice()
+                                    self.cachedDefaultInputUID = defaultInput?.uid ?? ""
+                                    guard newDevices.isEmpty == false else { return }
                                     if let selectedInput = self.appServices.microphonePreferenceCoordinator
-                                        .inputDeviceForCapture(availableInputs: newDevices)
+                                        .reconcileMicrophoneSelection(
+                                            availableInputs: newDevices,
+                                            defaultInputUID: self.cachedDefaultInputUID
+                                        )
                                     {
                                         self.selectedInputUID = selectedInput.uid
                                     }
                                 }
-                            }
 
                             HStack {
                                 Text("Output Device")
@@ -1209,6 +1180,7 @@ struct SettingsView: View {
                     }
                     .padding(16)
                 }
+                .background(MicrophoneSettingsScrollAnchor())
 
                 // Overlay Settings Card
                 ThemedCard(style: .standard) {
@@ -1507,15 +1479,15 @@ struct SettingsView: View {
 
                 // Sync input device selection after refresh
                 if !self.inputDevices.isEmpty {
-                    let inputValid = self.inputDevices.contains { $0.uid == self.selectedInputUID }
-                    if !inputValid || self.selectedInputUID.isEmpty {
-                        if let defaultUID = AudioDevice.getDefaultInputDevice()?.uid,
-                           self.inputDevices.contains(where: { $0.uid == defaultUID })
-                        {
-                            self.selectedInputUID = defaultUID
-                        } else {
-                            self.selectedInputUID = self.inputDevices.first?.uid ?? ""
-                        }
+                    let defaultInput = AudioDevice.getDefaultInputDevice()
+                    self.cachedDefaultInputUID = defaultInput?.uid ?? ""
+                    if let selectedInput = self.appServices.microphonePreferenceCoordinator
+                        .reconcileMicrophoneSelection(
+                            availableInputs: self.inputDevices,
+                            defaultInputUID: self.cachedDefaultInputUID
+                        )
+                    {
+                        self.selectedInputUID = selectedInput.uid
                     }
                 }
 
@@ -1539,7 +1511,8 @@ struct SettingsView: View {
 
                 // CRITICAL FIX: Populate cached default device names after onAppear, not during view body evaluation.
                 // This avoids the CoreAudio/SwiftUI AttributeGraph race condition that causes EXC_BAD_ACCESS.
-                self.cachedDefaultInputName = AudioDevice.getDefaultInputDevice()?.name ?? ""
+                let defaultInput = AudioDevice.getDefaultInputDevice()
+                self.cachedDefaultInputUID = defaultInput?.uid ?? ""
                 self.cachedDefaultOutputName = AudioDevice.getDefaultOutputDevice()?.name ?? ""
                 self.refreshRollbackState()
                 self.settings.refreshLaunchAtStartupStatus(clearError: true, logMismatch: false)
@@ -2255,38 +2228,248 @@ struct SettingsView: View {
 }
 
 private extension SettingsView {
-    var selectedInputDevice: AudioDevice.Device? {
-        self.inputDevices.first { $0.uid == self.selectedInputUID }
+    var microphonePrioritySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Input Device Priority")
+                    .font(self.theme.typography.bodyStrong)
+                    .foregroundStyle(self.settingsTitleText)
+
+                Spacer()
+
+                if self.settings.suppressedMicrophoneUIDs.isEmpty == false {
+                    Button {
+                        self.settings.restoreRemovedMicrophones(with: self.inputDevices)
+                        self.refreshActiveInputSelection()
+                    } label: {
+                        Label("Restore Removed", systemImage: "arrow.uturn.backward")
+                    }
+                    .buttonStyle(.plain)
+                    .font(self.theme.typography.bodySmall)
+                    .foregroundStyle(self.theme.palette.accent)
+                    .disabled(self.isMicrophonePriorityEditingDisabled)
+                }
+            }
+
+            VStack(spacing: 0) {
+                if self.settings.microphonePriority.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: "mic.slash")
+                            .foregroundStyle(self.settingsSecondaryText)
+                        Text(self.inputDevices.isEmpty ? "No microphones available" : "No microphones in priority")
+                            .font(self.theme.typography.bodySmall)
+                            .foregroundStyle(self.settingsSecondaryText)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 42)
+                } else {
+                    ForEach(Array(self.settings.microphonePriority.enumerated()), id: \.element.uid) { index, entry in
+                        if index > 0 {
+                            Divider().opacity(0.55)
+                        }
+                        self.microphonePriorityRow(entry, rank: index + 1)
+                    }
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(self.theme.palette.cardBackground.opacity(self.colorScheme == .light ? 0.72 : 0.52))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(self.theme.palette.cardBorder.opacity(0.7), lineWidth: 1)
+                    )
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text("FluidVoice tries microphones from top to bottom. Drag to reorder; unavailable devices keep their place.")
+                .font(self.theme.typography.bodySmall)
+                .foregroundStyle(self.settingsSecondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
-    func inputDeviceTitle(_ device: AudioDevice.Device) -> String {
-        var annotations: [String] = []
-        if self.cachedDefaultInputName.isEmpty == false,
-           device.name == self.cachedDefaultInputName
-        {
-            annotations.append("System Default")
-        }
-        if device.isBuiltIn {
-            annotations.append("Recommended")
-        } else if device.isBluetooth {
-            annotations.append("Reduces output quality")
-        }
+    func microphonePriorityRow(
+        _ entry: SettingsStore.MicrophonePriorityEntry,
+        rank: Int
+    ) -> some View {
+        let connectedDevice = self.inputDevices.first { $0.uid == entry.uid }
+        let isAvailable = connectedDevice.map {
+            self.appServices.microphonePreferenceCoordinator.isInputDeviceAvailable($0)
+        } ?? false
+        let isActive = entry.uid == self.microphonePreferenceCoordinator.confirmedActiveInputUID && isAvailable
+        let isHovered = self.hoveredMicrophoneUID == entry.uid
 
-        guard annotations.isEmpty == false else { return device.name }
-        return "\(device.name) (\(annotations.joined(separator: ", ")))"
+        return HStack(spacing: 10) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(self.settingsTertiaryText.opacity(self.isMicrophonePriorityEditingDisabled ? 0.35 : 0.72))
+                .frame(width: 18, height: 30)
+                .contentShape(Rectangle())
+                .onDrag {
+                    self.draggedMicrophoneUID = entry.uid
+                    return NSItemProvider(object: entry.uid as NSString)
+                } preview: {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(self.theme.palette.cardBackground)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .stroke(self.theme.palette.cardBorder.opacity(0.8), lineWidth: 1)
+                            )
+
+                        Image(systemName: "line.3.horizontal")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(self.settingsTitleText)
+                    }
+                    .frame(width: 30, height: 30)
+                    .shadow(color: Color.black.opacity(0.18), radius: 5, y: 2)
+                }
+                .allowsHitTesting(self.isMicrophonePriorityEditingDisabled == false)
+                .accessibilityHidden(true)
+
+            Text("\(rank).")
+                .font(self.theme.typography.bodySmall)
+                .foregroundStyle(self.settingsSecondaryText)
+                .monospacedDigit()
+                .frame(width: 22, alignment: .trailing)
+
+            Text(entry.name)
+                .font(self.theme.typography.bodyStrong)
+                .foregroundStyle(isAvailable ? self.settingsTitleText : self.settingsSecondaryText)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            if isHovered {
+                Button(role: .destructive) {
+                    self.removeMicrophonePriorityEntry(entry)
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color(nsColor: .systemRed).opacity(0.82))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(self.isMicrophonePriorityEditingDisabled)
+                .help("Remove \(entry.name) from microphone priority")
+                .accessibilityLabel("Remove \(entry.name)")
+                .transition(.opacity)
+            } else if isActive {
+                Circle()
+                    .fill(Color(nsColor: .systemGreen))
+                    .frame(width: 7, height: 7)
+                    .shadow(color: Color(nsColor: .systemGreen).opacity(0.45), radius: 3)
+                    .accessibilityLabel("Active microphone")
+            } else if isAvailable == false {
+                Text("Unavailable")
+                    .font(self.theme.typography.bodySmall)
+                    .foregroundStyle(self.settingsSecondaryText)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 42)
+        .contentShape(Rectangle())
+        .opacity(isAvailable ? 1 : 0.62)
+        .onHover { isHovering in
+            let animation: Animation? = self.accessibilityReduceMotion ? nil : .easeOut(duration: 0.12)
+            withAnimation(animation) {
+                if isHovering {
+                    self.hoveredMicrophoneUID = entry.uid
+                } else if self.hoveredMicrophoneUID == entry.uid {
+                    self.hoveredMicrophoneUID = nil
+                }
+            }
+        }
+        .onDrop(
+            of: [UTType.plainText.identifier],
+            delegate: MicrophonePriorityDropDelegate(
+                targetUID: entry.uid,
+                settings: self.settings,
+                draggedUID: self.$draggedMicrophoneUID,
+                reorderAnimation: self.accessibilityReduceMotion ? nil : .easeInOut(duration: 0.16),
+                onDropCompleted: self.refreshActiveInputSelection
+            )
+        )
+        .contextMenu {
+            Button("Move Up") {
+                self.settings.moveMicrophonePriority(uid: entry.uid, by: -1)
+                self.refreshActiveInputSelection()
+            }
+            .disabled(self.isMicrophonePriorityEditingDisabled || rank == 1)
+
+            Button("Move Down") {
+                self.settings.moveMicrophonePriority(uid: entry.uid, by: 1)
+                self.refreshActiveInputSelection()
+            }
+            .disabled(self.isMicrophonePriorityEditingDisabled || rank == self.settings.microphonePriority.count)
+
+            Divider()
+
+            Button("Remove from Priority", role: .destructive) {
+                self.removeMicrophonePriorityEntry(entry)
+            }
+            .disabled(self.isMicrophonePriorityEditingDisabled)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Priority \(rank), \(entry.name)")
+        .accessibilityValue(isActive ? "Active" : (isAvailable ? "Available" : "Unavailable"))
+        .accessibilityAction(named: "Move up") {
+            guard self.isMicrophonePriorityEditingDisabled == false, rank > 1 else { return }
+            self.settings.moveMicrophonePriority(uid: entry.uid, by: -1)
+            self.refreshActiveInputSelection()
+        }
+        .accessibilityAction(named: "Move down") {
+            guard self.isMicrophonePriorityEditingDisabled == false,
+                  rank < self.settings.microphonePriority.count
+            else { return }
+            self.settings.moveMicrophonePriority(uid: entry.uid, by: 1)
+            self.refreshActiveInputSelection()
+        }
+        .accessibilityAction(named: "Remove from priority") {
+            guard self.isMicrophonePriorityEditingDisabled == false else { return }
+            self.removeMicrophonePriorityEntry(entry)
+        }
+    }
+
+    var isMicrophonePriorityEditingDisabled: Bool {
+        self.asr.isRunning || self.asr.isStarting
+    }
+
+    func refreshActiveInputSelection() {
+        // Reuse the existing off-main hardware refresh so the green active
+        // indicator and next capture resolve from live Core Audio.
+        self.refreshDevices()
+    }
+
+    func removeMicrophonePriorityEntry(_ entry: SettingsStore.MicrophonePriorityEntry) {
+        self.hoveredMicrophoneUID = nil
+        self.settings.removeMicrophoneFromPriority(
+            uid: entry.uid,
+            isConnected: self.inputDevices.contains { $0.uid == entry.uid }
+        )
+        self.refreshActiveInputSelection()
+    }
+
+    var selectedInputDevice: AudioDevice.Device? {
+        guard let confirmedUID = self.microphonePreferenceCoordinator.confirmedActiveInputUID else {
+            return nil
+        }
+        return self.inputDevices.first { $0.uid == confirmedUID }
     }
 
     @ViewBuilder
     var microphoneQualityGuidance: some View {
         if self.selectedInputDevice?.isBluetooth == true {
             self.microphoneQualityGuidanceRow(
-                message: "AirPods and other Bluetooth microphones reduce headphone audio quality. Use your Mac’s microphone or another non-Bluetooth mic.",
+                message: "Bluetooth microphone mode can reduce headphone playback quality. Prefer a wired, USB, or display microphone when available.",
                 systemImage: "exclamationmark.triangle.fill",
                 color: self.theme.palette.warning
             )
         } else {
             self.microphoneQualityGuidanceRow(
-                message: "For the best audio quality, use your Mac’s microphone or another non-Bluetooth mic.",
+                message: "This order applies only to FluidVoice and does not change your macOS input.",
                 systemImage: "info.circle",
                 color: self.settingsSecondaryText
             )
@@ -2307,20 +2490,45 @@ private extension SettingsView {
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
+}
 
-    var microphoneModeInfo: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "info.circle")
-                .foregroundStyle(self.settingsSecondaryText)
-                .font(self.theme.typography.bodyStrong)
-            Text(
-                "FluidVoice uses this microphone independently from the macOS default."
+private struct MicrophonePriorityDropDelegate: DropDelegate {
+    let targetUID: String
+    let settings: SettingsStore
+    @Binding var draggedUID: String?
+    let reorderAnimation: Animation?
+    let onDropCompleted: () -> Void
+
+    func validateDrop(info _: DropInfo) -> Bool {
+        self.draggedUID != nil
+    }
+
+    func dropEntered(info _: DropInfo) {
+        guard let draggedUID = self.draggedUID,
+              draggedUID != self.targetUID
+        else { return }
+
+        let entries = self.settings.microphonePriority
+        guard let sourceIndex = entries.firstIndex(where: { $0.uid == draggedUID }),
+              let targetIndex = entries.firstIndex(where: { $0.uid == self.targetUID })
+        else { return }
+
+        withAnimation(self.reorderAnimation) {
+            self.settings.reorderMicrophonePriority(
+                fromOffsets: IndexSet(integer: sourceIndex),
+                toOffset: targetIndex > sourceIndex ? targetIndex + 1 : targetIndex
             )
-            .font(self.theme.typography.bodySmall)
-            .foregroundStyle(self.settingsSecondaryText)
-            .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.vertical, 4)
+    }
+
+    func dropUpdated(info _: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info _: DropInfo) -> Bool {
+        self.draggedUID = nil
+        self.onDropCompleted()
+        return true
     }
 }
 
@@ -2333,12 +2541,23 @@ private final class SettingsPersistentScroller: NSScroller {
 private struct SettingsPersistentScrollView<Content: View>: NSViewRepresentable {
     private let theme: AppTheme
     private let colorScheme: ColorScheme
+    private let microphoneSettingsScrollRequest: Int
     private let content: Content
 
-    init(theme: AppTheme, colorScheme: ColorScheme, @ViewBuilder content: () -> Content) {
+    init(
+        theme: AppTheme,
+        colorScheme: ColorScheme,
+        microphoneSettingsScrollRequest: Int,
+        @ViewBuilder content: () -> Content
+    ) {
         self.theme = theme
         self.colorScheme = colorScheme
+        self.microphoneSettingsScrollRequest = microphoneSettingsScrollRequest
         self.content = content()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
     }
 
     private var hostedContent: AnyView {
@@ -2378,7 +2597,7 @@ private struct SettingsPersistentScrollView<Content: View>: NSViewRepresentable 
         return scrollView
     }
 
-    func updateNSView(_ scrollView: NSScrollView, context _: Context) {
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
         (scrollView.documentView as? NSHostingView<AnyView>)?.rootView = self.hostedContent
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -2389,6 +2608,56 @@ private struct SettingsPersistentScrollView<Content: View>: NSViewRepresentable 
         }
         scrollView.verticalScroller?.isHidden = false
         scrollView.verticalScroller?.alphaValue = 1
+
+        guard self.microphoneSettingsScrollRequest > 0,
+              context.coordinator.lastMicrophoneSettingsScrollRequest != self.microphoneSettingsScrollRequest
+        else { return }
+        context.coordinator.lastMicrophoneSettingsScrollRequest = self.microphoneSettingsScrollRequest
+        DispatchQueue.main.async {
+            Self.scrollToMicrophoneSettings(in: scrollView)
+        }
+    }
+
+    private static func scrollToMicrophoneSettings(in scrollView: NSScrollView) {
+        guard let documentView = scrollView.documentView else { return }
+        documentView.layoutSubtreeIfNeeded()
+        guard let anchor = documentView.descendant(withIdentifier: MicrophoneSettingsScrollAnchor.identifier) else {
+            return
+        }
+
+        let targetRect = anchor.convert(anchor.bounds, to: documentView)
+        let maximumY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
+        let targetY = min(maximumY, max(0, targetRect.minY - 12))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    final class Coordinator {
+        var lastMicrophoneSettingsScrollRequest = 0
+    }
+}
+
+private struct MicrophoneSettingsScrollAnchor: NSViewRepresentable {
+    static let identifier = NSUserInterfaceItemIdentifier("FluidVoice.MicrophoneSettingsScrollAnchor")
+
+    func makeNSView(context _: Context) -> NSView {
+        let view = NSView()
+        view.identifier = Self.identifier
+        return view
+    }
+
+    func updateNSView(_: NSView, context _: Context) {}
+}
+
+private extension NSView {
+    func descendant(withIdentifier identifier: NSUserInterfaceItemIdentifier) -> NSView? {
+        if self.identifier == identifier { return self }
+        for subview in self.subviews {
+            if let match = subview.descendant(withIdentifier: identifier) {
+                return match
+            }
+        }
+        return nil
     }
 }
 

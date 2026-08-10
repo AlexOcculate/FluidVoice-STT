@@ -309,6 +309,7 @@ struct ContentView: View {
     @State private var savedProviders: [SettingsStore.SavedProvider] = []
     @State private var selectedProviderID: String = SettingsStore.shared.selectedProviderID
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var microphoneSettingsScrollRequest = 0
 
     var body: some View {
         let layout = AnyView(
@@ -601,10 +602,6 @@ struct ContentView: View {
                 await self.asr.initialize()
                 self.menuBarManager.configure(asrService: self.appServices.asr)
                 self.refreshDevices()
-
-                if let preferredUID = SettingsStore.shared.preferredInputDeviceUID, !preferredUID.isEmpty {
-                    self.selectedInputUID = preferredUID
-                }
 
                 if self.selectedOutputUID.isEmpty, let defOut = AudioDevice.getDefaultOutputDevice()?.uid {
                     self.selectedOutputUID = defOut
@@ -952,12 +949,14 @@ struct ContentView: View {
     @MainActor
     private func handleMenuBarNavigation(_ destination: MenuBarNavigationDestination?) {
         guard let destination else { return }
-        defer { menuBarManager.requestedNavigationDestination = nil }
         guard !self.settings.shouldShowOnboarding else { return }
 
         switch destination {
         case .customDictionary:
             self.selectedSidebarItem = .customDictionary
+        case .microphoneSettings:
+            self.selectedSidebarItem = .preferences
+            self.microphoneSettingsScrollRequest &+= 1
         case .preferences:
             self.selectedSidebarItem = .preferences
         }
@@ -1446,6 +1445,7 @@ struct ContentView: View {
 
     private var preferencesView: some View {
         SettingsView(
+            microphonePreferenceCoordinator: self.appServices.microphonePreferenceCoordinator,
             appear: self.$appear,
             visualizerNoiseThreshold: self.$visualizerNoiseThreshold,
             selectedInputUID: self.$selectedInputUID,
@@ -1474,7 +1474,8 @@ struct ContentView: View {
             openAccessibilitySettings: self.openAccessibilitySettings,
             restartApp: self.restartApp,
             revealAppInFinder: self.revealAppInFinder,
-            openApplicationsFolder: self.openApplicationsFolder
+            openApplicationsFolder: self.openApplicationsFolder,
+            microphoneSettingsScrollRequest: self.microphoneSettingsScrollRequest
         )
     }
 
@@ -1520,11 +1521,15 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let inputs = AudioDevice.listInputDevices()
             let outputs = AudioDevice.listOutputDevices()
+            let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
             DispatchQueue.main.async {
                 self.inputDevices = inputs
                 self.outputDevices = outputs
                 if let selectedInput = self.appServices.microphonePreferenceCoordinator
-                    .inputDeviceForCapture(availableInputs: inputs)
+                    .reconcileMicrophoneSelection(
+                        availableInputs: inputs,
+                        defaultInputUID: defaultInputUID
+                    )
                 {
                     self.selectedInputUID = selectedInput.uid
                 }
@@ -4381,7 +4386,6 @@ private extension ContentView {
         self.isRewriteModeShortcutEnabled = SettingsStore.shared.rewriteModeShortcutEnabled
         self.playgroundUsed = SettingsStore.shared.playgroundUsed
         self.visualizerNoiseThreshold = SettingsStore.shared.visualizerNoiseThreshold
-        self.selectedInputUID = SettingsStore.shared.preferredInputDeviceUID ?? ""
         self.selectedOutputUID = SettingsStore.shared.preferredOutputDeviceUID ?? ""
         self.enableDebugLogs = SettingsStore.shared.enableDebugLogs
         self.hotkeyMode = SettingsStore.shared.hotkeyMode

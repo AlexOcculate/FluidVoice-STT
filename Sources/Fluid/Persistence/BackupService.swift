@@ -63,6 +63,12 @@ struct SettingsBackupPayload: Codable, Equatable {
     let copyTranscriptionToClipboard: Bool
     let textInsertionMode: SettingsStore.TextInsertionMode
     let preferredInputDeviceUID: String?
+    // Optional so backups created before microphone priority ordering still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let microphonePriority: [SettingsStore.MicrophonePriorityEntry]?
+    // Optional so backups created before microphone removal history still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let suppressedMicrophoneUIDs: [String]?
     let preferredOutputDeviceUID: String?
     let microphoneSelectionMode: SettingsStore.MicrophoneSelectionMode?
     let visualizerNoiseThreshold: Double

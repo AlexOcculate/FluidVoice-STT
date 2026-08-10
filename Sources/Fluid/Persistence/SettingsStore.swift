@@ -11,6 +11,8 @@ import FluidAudio
 
 // swiftlint:disable file_length type_body_length
 final class SettingsStore: ObservableObject {
+    static let microphonePriorityMigrationVersion = 4
+
     static let shared = SettingsStore()
     static let transcriptionPreviewCharLimitRange: ClosedRange<Int> = 50...800
     static let transcriptionPreviewCharLimitStep = 50
@@ -195,6 +197,13 @@ final class SettingsStore: ObservableObject {
                 return "Use Preferred Microphone"
             }
         }
+    }
+
+    struct MicrophonePriorityEntry: Codable, Hashable, Identifiable {
+        let uid: String
+        var name: String
+
+        var id: String { self.uid }
     }
 
     enum DictationPromptSelection: Equatable {
@@ -1813,30 +1822,184 @@ final class SettingsStore: ObservableObject {
         set { self.defaults.set(newValue, forKey: Keys.preferredInputDeviceUID) }
     }
 
+    var microphonePriority: [MicrophonePriorityEntry] {
+        get {
+            guard let data = self.defaults.data(forKey: Keys.microphonePriority),
+                  let entries = try? JSONDecoder().decode([MicrophonePriorityEntry].self, from: data)
+            else { return [] }
+            return Self.normalizedMicrophonePriority(entries)
+        }
+        set {
+            let entries = Self.normalizedMicrophonePriority(newValue)
+            guard entries != self.microphonePriority else { return }
+            objectWillChange.send()
+            if let data = try? JSONEncoder().encode(entries) {
+                self.defaults.set(data, forKey: Keys.microphonePriority)
+            } else {
+                self.defaults.removeObject(forKey: Keys.microphonePriority)
+            }
+            if let firstUID = entries.first?.uid {
+                self.preferredInputDeviceUID = firstUID
+            }
+        }
+    }
+
+    var suppressedMicrophoneUIDs: Set<String> {
+        get { Set(self.defaults.stringArray(forKey: Keys.suppressedMicrophoneUIDs) ?? []) }
+        set {
+            if newValue.isEmpty {
+                self.defaults.removeObject(forKey: Keys.suppressedMicrophoneUIDs)
+            } else {
+                self.defaults.set(newValue.sorted(), forKey: Keys.suppressedMicrophoneUIDs)
+            }
+        }
+    }
+
     var preferredOutputDeviceUID: String? {
         get { self.defaults.string(forKey: Keys.preferredOutputDeviceUID) }
         set { self.defaults.set(newValue, forKey: Keys.preferredOutputDeviceUID) }
     }
 
-    var microphoneSelectionMode: MicrophoneSelectionMode { .manual }
-
-    func enforceAppOnlyMicrophoneSelection() {
-        guard self.defaults.string(forKey: Keys.microphoneSelectionMode) != MicrophoneSelectionMode.manual.rawValue else {
-            return
-        }
-        objectWillChange.send()
-        self.defaults.set(MicrophoneSelectionMode.manual.rawValue, forKey: Keys.microphoneSelectionMode)
+    var storedMicSelectionModeForMigration: MicrophoneSelectionMode {
+        guard let rawValue = self.defaults.string(forKey: Keys.microphoneSelectionMode),
+              let mode = MicrophoneSelectionMode(rawValue: rawValue)
+        else { return .system }
+        return mode
     }
 
-    func recordInputDeviceSelection(_ uid: String) {
+    var microphoneSelectionMode: MicrophoneSelectionMode {
+        get {
+            guard let rawValue = self.defaults.string(forKey: Keys.microphoneSelectionMode),
+                  let mode = MicrophoneSelectionMode(rawValue: rawValue)
+            else { return .manual }
+            return mode
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue.rawValue, forKey: Keys.microphoneSelectionMode)
+        }
+    }
+
+    func recordInputDeviceSelection(_ uid: String, name: String? = nil) {
         guard uid.isEmpty == false else { return }
 
-        self.preferredInputDeviceUID = uid
+        var suppressedUIDs = self.suppressedMicrophoneUIDs
+        suppressedUIDs.remove(uid)
+        self.suppressedMicrophoneUIDs = suppressedUIDs
+
+        var entries = self.microphonePriority.filter { $0.uid != uid }
+        let existingName = self.microphonePriority.first { $0.uid == uid }?.name
+        entries.insert(
+            MicrophonePriorityEntry(uid: uid, name: name ?? existingName ?? "Microphone"),
+            at: 0
+        )
+        self.microphonePriority = entries
+        self.microphoneSelectionMode = .manual
     }
 
-    var appMicSelectionMigrationVersion: Int {
-        get { self.defaults.integer(forKey: Keys.appMicSelectionMigrationVersion) }
-        set { self.defaults.set(newValue, forKey: Keys.appMicSelectionMigrationVersion) }
+    func reconcileMicrophonePriority(with devices: [AudioDevice.Device]) {
+        var entries = self.microphonePriority
+        let preferredUID = self.preferredInputDeviceUID
+        let connectedUIDs = Set(devices.map(\.uid))
+        var suppressedUIDs = self.suppressedMicrophoneUIDs
+        suppressedUIDs.formIntersection(connectedUIDs)
+        self.suppressedMicrophoneUIDs = suppressedUIDs
+
+        if entries.isEmpty,
+           let preferredUID,
+           preferredUID.isEmpty == false
+        {
+            let name = devices.first { $0.uid == preferredUID }?.name ?? "Previously selected microphone"
+            entries.append(MicrophonePriorityEntry(uid: preferredUID, name: name))
+        }
+
+        var knownUIDs = Set(entries.map(\.uid))
+        let newEntries = devices.compactMap { device -> MicrophonePriorityEntry? in
+            guard suppressedUIDs.contains(device.uid) == false,
+                  knownUIDs.insert(device.uid).inserted
+            else { return nil }
+            return MicrophonePriorityEntry(uid: device.uid, name: device.name)
+        }
+        if newEntries.isEmpty == false {
+            // Keep the user's first choice stable while making a newly connected
+            // microphone the immediate fallback. Its position remains persisted
+            // when the device later disconnects.
+            entries.insert(contentsOf: newEntries, at: min(1, entries.count))
+        }
+
+        let namesByUID = Dictionary(
+            devices.map { ($0.uid, $0.name) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        entries = entries.map { entry in
+            MicrophonePriorityEntry(uid: entry.uid, name: namesByUID[entry.uid] ?? entry.name)
+        }
+        self.microphonePriority = entries
+    }
+
+    func removeMicrophoneFromPriority(uid: String, isConnected: Bool) {
+        guard uid.isEmpty == false else { return }
+
+        var suppressedUIDs = self.suppressedMicrophoneUIDs
+        if isConnected {
+            suppressedUIDs.insert(uid)
+        } else {
+            suppressedUIDs.remove(uid)
+        }
+        self.suppressedMicrophoneUIDs = suppressedUIDs
+
+        let entries = self.microphonePriority.filter { $0.uid != uid }
+        self.microphonePriority = entries
+        if entries.isEmpty {
+            self.preferredInputDeviceUID = nil
+        }
+    }
+
+    func restoreRemovedMicrophones(with devices: [AudioDevice.Device]) {
+        self.suppressedMicrophoneUIDs = []
+        self.reconcileMicrophonePriority(with: devices)
+    }
+
+    func reorderMicrophonePriority(fromOffsets: IndexSet, toOffset: Int) {
+        var entries = self.microphonePriority
+        entries.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        self.microphonePriority = entries
+    }
+
+    func moveMicrophonePriority(uid: String, before targetUID: String) {
+        guard uid != targetUID else { return }
+        var entries = self.microphonePriority
+        guard let sourceIndex = entries.firstIndex(where: { $0.uid == uid }),
+              let targetIndex = entries.firstIndex(where: { $0.uid == targetUID })
+        else { return }
+
+        let entry = entries.remove(at: sourceIndex)
+        let adjustedTargetIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+        entries.insert(entry, at: adjustedTargetIndex)
+        self.microphonePriority = entries
+    }
+
+    func moveMicrophonePriority(uid: String, by offset: Int) {
+        var entries = self.microphonePriority
+        guard let sourceIndex = entries.firstIndex(where: { $0.uid == uid }) else { return }
+        let destination = min(max(sourceIndex + offset, 0), entries.count - 1)
+        guard destination != sourceIndex else { return }
+        entries.swapAt(sourceIndex, destination)
+        self.microphonePriority = entries
+    }
+
+    private static func normalizedMicrophonePriority(
+        _ entries: [MicrophonePriorityEntry]
+    ) -> [MicrophonePriorityEntry] {
+        var seen = Set<String>()
+        return entries.filter { entry in
+            entry.uid.isEmpty == false && seen.insert(entry.uid).inserted
+        }
+    }
+
+    var microphoneSelectionMigrationVersion: Int {
+        get { self.defaults.integer(forKey: Keys.microphoneSelectionMigrationVersion) }
+        set { self.defaults.set(newValue, forKey: Keys.microphoneSelectionMigrationVersion) }
     }
 
     var visualizerNoiseThreshold: Double {
@@ -3023,8 +3186,12 @@ final class SettingsStore: ObservableObject {
             copyTranscriptionToClipboard: self.copyTranscriptionToClipboard,
             textInsertionMode: self.textInsertionMode,
             preferredInputDeviceUID: self.preferredInputDeviceUID,
+            microphonePriority: self.microphonePriority,
+            suppressedMicrophoneUIDs: self.suppressedMicrophoneUIDs.sorted(),
             preferredOutputDeviceUID: self.preferredOutputDeviceUID,
-            microphoneSelectionMode: self.microphoneSelectionMode,
+            // Kept in the backup schema for compatibility with older builds.
+            // Current builds always resolve microphones from the priority list.
+            microphoneSelectionMode: .manual,
             visualizerNoiseThreshold: self.visualizerNoiseThreshold,
             overlayPosition: self.overlayPosition,
             overlayBottomOffset: self.overlayBottomOffset,
@@ -3142,11 +3309,22 @@ final class SettingsStore: ObservableObject {
         self.copyTranscriptionToClipboard = payload.copyTranscriptionToClipboard
         self.textInsertionMode = payload.textInsertionMode
         self.preferredInputDeviceUID = payload.preferredInputDeviceUID
-        self.preferredOutputDeviceUID = payload.preferredOutputDeviceUID
-        if payload.microphoneSelectionMode == .system {
-            self.appMicSelectionMigrationVersion = 0
+        self.suppressedMicrophoneUIDs = Set(payload.suppressedMicrophoneUIDs ?? [])
+        if let microphonePriority = payload.microphonePriority {
+            self.microphonePriority = microphonePriority
+        } else {
+            self.microphonePriority = []
         }
-        self.enforceAppOnlyMicrophoneSelection()
+        self.preferredOutputDeviceUID = payload.preferredOutputDeviceUID
+        if payload.microphonePriority != nil {
+            self.microphoneSelectionMode = .manual
+            self.microphoneSelectionMigrationVersion = Self.microphonePriorityMigrationVersion
+        } else if payload.microphoneSelectionMode == .system {
+            self.microphoneSelectionMode = .system
+            self.microphoneSelectionMigrationVersion = 0
+        } else {
+            self.microphoneSelectionMode = .manual
+        }
         self.visualizerNoiseThreshold = payload.visualizerNoiseThreshold
         self.overlayPosition = payload.overlayPosition
         self.overlayBottomOffset = payload.overlayBottomOffset
@@ -4884,9 +5062,12 @@ private extension SettingsStore {
         static let hotkeyShortcutKey = "HotkeyShortcutKey"
         static let primaryDictationShortcutsKey = "PrimaryDictationShortcuts"
         static let preferredInputDeviceUID = "PreferredInputDeviceUID"
+        static let microphonePriority = "MicrophonePriority"
+        static let suppressedMicrophoneUIDs = "SuppressedMicrophoneUIDs"
         static let preferredOutputDeviceUID = "PreferredOutputDeviceUID"
         static let microphoneSelectionMode = "MicrophoneSelectionMode"
-        static let appMicSelectionMigrationVersion = "AppOnlyMicrophoneSelectionMigrationVersion"
+        // Keep the original persisted key so existing installs migrate in place.
+        static let microphoneSelectionMigrationVersion = "AppOnlyMicrophoneSelectionMigrationVersion"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
         static let launchAtStartup = "LaunchAtStartup"
         static let showInDock = "ShowInDock"

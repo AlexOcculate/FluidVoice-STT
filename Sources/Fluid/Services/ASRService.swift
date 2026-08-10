@@ -205,6 +205,8 @@ final class ASRService: ObservableObject {
     private var hasPendingParakeetVocabularyReload: Bool = false
     private var vocabularyChangeObserver: NSObjectProtocol?
     private var settingsBackupRestoreObserver: NSObjectProtocol?
+    private var clamshellStateChangeObserver: NSObjectProtocol?
+    private var inputDeviceAvailabilityChangeObserver: NSObjectProtocol?
 
     // MARK: - Error Handling
 
@@ -755,6 +757,8 @@ final class ASRService: ObservableObject {
     }()
 
     private var activeAudioCaptureBackend: AudioCaptureBackend = .none
+    private var audioStartAttemptInputUID: String?
+    private var audioStartAttemptInputName: String?
 
     private var hasPreparedAudioCapture: Bool {
         self.directAudioLifecycleController.snapshot.isPrepared || self.hasWarmAudioEngine
@@ -904,17 +908,24 @@ final class ASRService: ObservableObject {
         }
     }
 
-    private func resolvedInputDeviceForCapture() -> AudioDevice.Device? {
-        AppServices.shared.microphonePreferenceCoordinator.inputDeviceForCapture()
+    private func resolvedInputDeviceForCapture(
+        excluding excludedUIDs: Set<String> = []
+    ) -> AudioDevice.Device? {
+        let inputs = AudioDevice.listInputDevices()
+        return AppServices.shared.microphonePreferenceCoordinator.inputDeviceForCapture(
+            availableInputs: inputs,
+            defaultInputUID: AudioDevice.getDefaultInputDevice()?.uid,
+            excluding: excludedUIDs
+        )
     }
 
-    private func directCoreAudioDeviceSelection() -> DirectCoreAudioDeviceSelection {
-        if let preferredUID = SettingsStore.shared.preferredInputDeviceUID,
-           preferredUID.isEmpty == false
-        {
-            return .preferredUID(preferredUID)
+    private func directCoreAudioDeviceSelection(
+        excluding excludedUIDs: Set<String> = []
+    ) -> DirectCoreAudioDeviceSelection? {
+        if let inputUID = self.resolvedInputDeviceForCapture(excluding: excludedUIDs)?.uid {
+            return .preferredUID(inputUID)
         }
-        return .systemDefault
+        return nil
     }
 
     /// Prepares the direct device callback without starting hardware IO. This
@@ -930,8 +941,15 @@ final class ASRService: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Microphone access is not authorized."]
             )
         }
+        guard let selection = self.directCoreAudioDeviceSelection() else {
+            throw NSError(
+                domain: "ASRService",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "No usable microphone is available."]
+            )
+        }
         let device = try await self.directAudioLifecycleController.resolveDevice(
-            selection: self.directCoreAudioDeviceSelection(),
+            selection: selection,
             reason: "prepare:\(reason)"
         )
         let snapshot = try await self.directAudioLifecycleController.prepare(
@@ -949,17 +967,35 @@ final class ASRService: ObservableObject {
         return snapshot
     }
 
-    private func startConfiguredAudioCapture() async throws {
+    private func startConfiguredAudioCapture(
+        excluding excludedInputUIDs: Set<String> = []
+    ) async throws {
+        self.audioStartAttemptInputUID = nil
+        self.audioStartAttemptInputName = nil
         if SettingsStore.shared.experimentalDirectAudioCaptureEnabled {
             // A non-route path may have scheduled a fire-and-forget retirement.
             // Do not let direct capture startup overlap a queued AVAudioEngine
             // release.
             await self.audioEngineRetirementDrain.waitForScheduledReleases()
             do {
+                guard let selection = self.directCoreAudioDeviceSelection(
+                    excluding: excludedInputUIDs
+                ) else {
+                    throw NSError(
+                        domain: "ASRService",
+                        code: -4,
+                        userInfo: [NSLocalizedDescriptionKey: "No remaining microphone is available."]
+                    )
+                }
+                if case let .preferredUID(uid) = selection {
+                    self.audioStartAttemptInputUID = uid
+                }
                 let device = try await self.directAudioLifecycleController.resolveDevice(
-                    selection: self.directCoreAudioDeviceSelection(),
+                    selection: selection,
                     reason: "recording_start"
                 )
+                self.audioStartAttemptInputUID = device.uid
+                self.audioStartAttemptInputName = device.name
                 let snapshot = try await self.directAudioLifecycleController.start(
                     deviceID: device.id,
                     deviceName: device.name,
@@ -1181,6 +1217,26 @@ final class ASRService: ObservableObject {
                 )
             }
         }
+        self.clamshellStateChangeObserver = NotificationCenter.default.addObserver(
+            forName: .clamshellStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let isClosed = notification.userInfo?["isClosed"] as? Bool ?? ClamshellState.isClosed
+            Task { @MainActor [weak self] in
+                self?.handleClamshellStateChanged(isClosed: isClosed)
+            }
+        }
+        self.inputDeviceAvailabilityChangeObserver = NotificationCenter.default.addObserver(
+            forName: .inputDeviceAvailabilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let deviceID = notification.userInfo?["deviceID"] as? AudioObjectID
+            Task { @MainActor [weak self] in
+                self?.handleInputDeviceAvailabilityChanged(deviceID: deviceID)
+            }
+        }
     }
 
     deinit {
@@ -1193,6 +1249,39 @@ final class ASRService: ObservableObject {
         if let observer = self.settingsBackupRestoreObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        if let observer = self.clamshellStateChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = self.inputDeviceAvailabilityChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    private func handleClamshellStateChanged(isClosed: Bool) {
+        DebugLogger.shared.info(
+            "Clamshell \(isClosed ? "closed" : "opened"); refreshing microphone availability",
+            source: "ASRService"
+        )
+        self.scheduleAudioRouteRecovery(
+            reason: isClosed ? "clamshell closed" : "clamshell opened",
+            requiresIdlePrewarm: true,
+            reconcilesInputSelection: true
+        )
+    }
+
+    private func handleInputDeviceAvailabilityChanged(deviceID: AudioObjectID?) {
+        let resolvedInput = AppServices.shared.microphonePreferenceCoordinator.inputDeviceForCapture()
+        let preparedDeviceID = self.directAudioLifecycleController.snapshot.deviceID
+        let confirmedUID = AppServices.shared.microphonePreferenceCoordinator.confirmedActiveInputUID
+        let activeSelectionChanged = self.isRunning && resolvedInput?.uid != confirmedUID
+        let preparedSelectionChanged = self.hasPreparedAudioCapture && resolvedInput?.id != preparedDeviceID
+        guard activeSelectionChanged || preparedSelectionChanged else { return }
+
+        self.scheduleAudioRouteRecovery(
+            reason: "input availability changed:\(deviceID ?? 0)",
+            requiresIdlePrewarm: true,
+            reconcilesInputSelection: true
+        )
     }
 
     @MainActor
@@ -1285,9 +1374,14 @@ final class ASRService: ObservableObject {
         guard self.isTerminating == false else { return }
 
         let microphonePreferenceCoordinator = AppServices.shared.microphonePreferenceCoordinator
-        microphonePreferenceCoordinator.reconcileAppOnlySelection(
+        microphonePreferenceCoordinator.reconcileMicrophoneSelection(
             availableInputs: initialInputSnapshot.0,
             defaultInputUID: initialInputSnapshot.1
+        )
+        microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
+            microphoneAuthorized: self.micStatus == .authorized,
+            launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
+                .shouldPresentStartupMicrophoneNotice ?? true
         )
 
         self.registerDefaultDeviceChangeListener()
@@ -1296,7 +1390,7 @@ final class ASRService: ObservableObject {
 
         // Initialize device list cache
         self.cacheCurrentDeviceList(initialInputSnapshot.0)
-        if microphonePreferenceCoordinator.needsAppOnlySelectionMigration {
+        if microphonePreferenceCoordinator.needsMicrophonePriorityMigration {
             self.scheduleAudioRouteRecovery(
                 reason: "app microphone migration pending",
                 requiresIdlePrewarm: true,
@@ -1489,13 +1583,26 @@ final class ASRService: ObservableObject {
 
         do {
             let maximumStartAttempts =
-                SettingsStore.shared.experimentalDirectAudioCaptureEnabled ? 3 : 1
+                SettingsStore.shared.experimentalDirectAudioCaptureEnabled
+                    ? max(AudioDevice.listInputDevices().count, 1) + 1
+                    : 1
             var startAttempt = 1
+            var failedInputUIDs = Set<String>()
+            var immediatelyRetriedInputUID: String?
+            self.audioStartAttemptInputUID = nil
             while true {
                 let routeGenerationAtStart = self.audioRouteRecoveryGeneration
                 do {
-                    try await self.startConfiguredAudioCapture()
+                    try await self.startConfiguredAudioCapture(excluding: failedInputUIDs)
                 } catch {
+                    guard let failedUID = self.audioStartAttemptInputUID else { throw error }
+                    let retrySameInput = immediatelyRetriedInputUID == nil
+                    if retrySameInput {
+                        immediatelyRetriedInputUID = failedUID
+                    }
+                    if retrySameInput == false {
+                        failedInputUIDs.insert(failedUID)
+                    }
                     guard startAttempt < maximumStartAttempts,
                           startGeneration == self.audioCaptureStartGeneration,
                           self.isTerminating == false
@@ -1506,7 +1613,8 @@ final class ASRService: ObservableObject {
                         sessionID: captureSessionID,
                         startGeneration: startGeneration,
                         completedAttempt: startAttempt,
-                        reason: "backend_start_error:\(error.localizedDescription)"
+                        reason: "backend_start_error:\(error.localizedDescription)",
+                        waitForTopologyQuiet: retrySameInput == false
                     )
                     startAttempt += 1
                     continue
@@ -1533,6 +1641,10 @@ final class ASRService: ObservableObject {
                     self.pendingAudioRouteRecovery == nil &&
                     self.isRecoveringAudioRoute == false
                 if readiness == .ready, routeStayedStable {
+                    AppServices.shared.microphonePreferenceCoordinator.confirmActiveSelection(
+                        uid: self.audioStartAttemptInputUID,
+                        name: self.audioStartAttemptInputName
+                    )
                     self.benchmarkLog(
                         "first_pcm_wait_end result=ready attempt=\(startAttempt) " +
                             "attemptID=\(readinessAttemptID) " +
@@ -1548,6 +1660,17 @@ final class ASRService: ObservableObject {
                 )
                 if readiness == .cancelled {
                     throw CancellationError()
+                }
+                var retrySameInput = false
+                if let failedUID = self.audioStartAttemptInputUID {
+                    retrySameInput = readiness == .formatInvalidated &&
+                        immediatelyRetriedInputUID == nil
+                    if retrySameInput {
+                        immediatelyRetriedInputUID = failedUID
+                    }
+                    if retrySameInput == false {
+                        failedInputUIDs.insert(failedUID)
+                    }
                 }
                 guard startAttempt < maximumStartAttempts else {
                     let message: String
@@ -1574,7 +1697,8 @@ final class ASRService: ObservableObject {
                     sessionID: captureSessionID,
                     startGeneration: startGeneration,
                     completedAttempt: startAttempt,
-                    reason: "readiness_\(readiness)_routeStable_\(routeStayedStable)"
+                    reason: "readiness_\(readiness)_routeStable_\(routeStayedStable)",
+                    waitForTopologyQuiet: retrySameInput == false
                 )
                 startAttempt += 1
             }
@@ -1661,11 +1785,16 @@ final class ASRService: ObservableObject {
             }
 
             guard wasCancelled == false else { return .failed }
+            AppServices.shared.microphonePreferenceCoordinator.markActiveSelectionUnavailable()
 
             // Provide user-friendly error feedback
+            let nsError = error as NSError
+            let noUsableMicrophone = nsError.domain == "ASRService" && nsError.code == -4
             let errorMessage: String
-            if let nsError = error as NSError?, nsError.domain == "ASRService" {
-                if let underlyingError = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            if nsError.domain == "ASRService" {
+                if noUsableMicrophone {
+                    errorMessage = "No usable microphone is available. Open your MacBook or connect a microphone, then try again."
+                } else if let underlyingError = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
                     // Extract useful info from AVFoundation error
                     if underlyingError.domain == AVFoundationErrorDomain || underlyingError.domain == NSOSStatusErrorDomain {
                         errorMessage = "Failed to start audio recording. The audio device may be in use by another application or unavailable. Please check your audio settings and try again."
@@ -1678,6 +1807,10 @@ final class ASRService: ObservableObject {
             } else {
                 errorMessage = "Failed to start audio recording: \(error.localizedDescription)"
             }
+
+            self.errorTitle = noUsableMicrophone ? "Microphone Unavailable" : "Recording Error"
+            self.errorMessage = errorMessage
+            self.showError = true
 
             // Post notification for UI to display
             NotificationCenter.default.post(
@@ -1704,7 +1837,8 @@ final class ASRService: ObservableObject {
         sessionID: Int,
         startGeneration: UInt64,
         completedAttempt: Int,
-        reason: String
+        reason: String,
+        waitForTopologyQuiet: Bool = true
     ) async throws -> UInt64 {
         self.audioCapturePipeline.setRecordingEnabled(false)
         await self.directAudioLifecycleController.invalidate(
@@ -1720,7 +1854,7 @@ final class ASRService: ObservableObject {
         else {
             throw CancellationError()
         }
-        if routeRecoveryWasPending == false {
+        if routeRecoveryWasPending == false, waitForTopologyQuiet {
             try await Task.sleep(nanoseconds: self.audioRouteRecoveryDelayNanoseconds)
         }
         guard startGeneration == self.audioCaptureStartGeneration,
@@ -2871,7 +3005,7 @@ final class ASRService: ObservableObject {
             return false
         }
 
-        AppServices.shared.microphonePreferenceCoordinator.reconcileAppOnlySelection(
+        AppServices.shared.microphonePreferenceCoordinator.reconcileMicrophoneSelection(
             availableInputs: snapshot.0,
             defaultInputUID: snapshot.1
         )
@@ -2920,69 +3054,129 @@ final class ASRService: ObservableObject {
         guard request.generation == self.audioRouteRecoveryGeneration, Task.isCancelled == false else { return }
 
         do {
-            self.audioCaptureAttemptID &+= 1
-            let readinessAttemptID = self.audioCaptureAttemptID
-            self.audioCaptureReadinessGate.arm(
-                sessionID: self.benchmarkSessionID,
-                attemptID: readinessAttemptID
-            )
-            self.audioCapturePipeline.setRecordingEnabled(
-                true,
-                sessionID: self.benchmarkSessionID,
-                attemptID: readinessAttemptID,
-                startHostTime: mach_absolute_time()
-            )
-            try await self.startConfiguredAudioCapture()
-            guard request.generation == self.audioRouteRecoveryGeneration,
-                  Task.isCancelled == false
-            else {
+            let maximumAttempts = SettingsStore.shared.experimentalDirectAudioCaptureEnabled
+                ? max(AudioDevice.listInputDevices().count, 1) + 1
+                : 1
+            var failedInputUIDs = Set<String>()
+            var immediatelyRetriedInputUID: String?
+            var completedAttempts = 0
+
+            while completedAttempts < maximumAttempts {
+                completedAttempts += 1
+                self.audioCaptureAttemptID &+= 1
+                let readinessAttemptID = self.audioCaptureAttemptID
+                self.audioCaptureReadinessGate.arm(
+                    sessionID: self.benchmarkSessionID,
+                    attemptID: readinessAttemptID
+                )
+                self.audioCapturePipeline.setRecordingEnabled(
+                    true,
+                    sessionID: self.benchmarkSessionID,
+                    attemptID: readinessAttemptID,
+                    startHostTime: mach_absolute_time()
+                )
+
+                do {
+                    try await self.startConfiguredAudioCapture(excluding: failedInputUIDs)
+                } catch {
+                    if let failedUID = self.audioStartAttemptInputUID {
+                        let retrySameInput = immediatelyRetriedInputUID == nil
+                        if retrySameInput {
+                            immediatelyRetriedInputUID = failedUID
+                        }
+                        if retrySameInput == false {
+                            failedInputUIDs.insert(failedUID)
+                        }
+                    }
+                    guard completedAttempts < maximumAttempts else { throw error }
+                    self.audioCapturePipeline.setRecordingEnabled(false)
+                    await self.stopActiveAudioCapture(
+                        retainDirectPreparedCapture: false,
+                        reason: "active_route_recovery_start_retry"
+                    )
+                    continue
+                }
+
+                guard request.generation == self.audioRouteRecoveryGeneration,
+                      Task.isCancelled == false
+                else {
+                    self.audioCapturePipeline.setRecordingEnabled(false)
+                    await self.stopActiveAudioCapture(
+                        retainDirectPreparedCapture: false,
+                        reason: "superseded_route_recovery_start"
+                    )
+                    return
+                }
+                let readiness = await self.audioCaptureReadinessGate.wait(
+                    sessionID: self.benchmarkSessionID,
+                    attemptID: readinessAttemptID,
+                    timeoutNanoseconds: self.firstPCMTimeoutNanoseconds
+                )
+                guard request.generation == self.audioRouteRecoveryGeneration,
+                      Task.isCancelled == false
+                else {
+                    self.audioCapturePipeline.setRecordingEnabled(false)
+                    await self.stopActiveAudioCapture(
+                        retainDirectPreparedCapture: false,
+                        reason: "superseded_route_recovery_readiness"
+                    )
+                    return
+                }
+                if readiness == .ready {
+                    AppServices.shared.microphonePreferenceCoordinator.confirmActiveSelection(
+                        uid: self.audioStartAttemptInputUID,
+                        name: self.audioStartAttemptInputName
+                    )
+                    self.benchmarkLog(
+                        "route_recovery_first_pcm generation=\(request.generation) " +
+                            "attempt=\(completedAttempts) attemptID=\(readinessAttemptID) " +
+                            "bufferedSamples=\(self.audioBuffer.count)"
+                    )
+
+                    if self.activeAudioCaptureBackend == .audioEngine,
+                       let currentDevice = self.getCurrentlyBoundInputDevice()
+                    {
+                        self.startMonitoringDevice(currentDevice.id)
+                    }
+
+                    DebugLogger.shared.info(
+                        "Audio route recovery succeeded (generation=\(request.generation), " +
+                            "attempt=\(completedAttempts))",
+                        source: "ASRService"
+                    )
+                    return
+                }
+
+                if let failedUID = self.audioStartAttemptInputUID {
+                    let retrySameInput = readiness == .formatInvalidated &&
+                        immediatelyRetriedInputUID == nil
+                    if retrySameInput {
+                        immediatelyRetriedInputUID = failedUID
+                    }
+                    if retrySameInput == false {
+                        failedInputUIDs.insert(failedUID)
+                    }
+                }
+                guard completedAttempts < maximumAttempts else {
+                    throw NSError(
+                        domain: "ASRService",
+                        code: -3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No replacement microphone delivered audio (\(readiness)).",
+                        ]
+                    )
+                }
                 self.audioCapturePipeline.setRecordingEnabled(false)
                 await self.stopActiveAudioCapture(
                     retainDirectPreparedCapture: false,
-                    reason: "superseded_route_recovery_start"
-                )
-                return
-            }
-            let readiness = await self.audioCaptureReadinessGate.wait(
-                sessionID: self.benchmarkSessionID,
-                attemptID: readinessAttemptID,
-                timeoutNanoseconds: self.firstPCMTimeoutNanoseconds
-            )
-            guard request.generation == self.audioRouteRecoveryGeneration,
-                  Task.isCancelled == false
-            else {
-                self.audioCapturePipeline.setRecordingEnabled(false)
-                await self.stopActiveAudioCapture(
-                    retainDirectPreparedCapture: false,
-                    reason: "superseded_route_recovery_readiness"
-                )
-                return
-            }
-            guard readiness == .ready else {
-                throw NSError(
-                    domain: "ASRService",
-                    code: -3,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "The replacement microphone did not deliver audio (\(readiness)).",
-                    ]
+                    reason: "active_route_recovery_readiness_retry"
                 )
             }
-            self.benchmarkLog(
-                "route_recovery_first_pcm generation=\(request.generation) " +
-                    "attemptID=\(readinessAttemptID) " +
-                    "bufferedSamples=\(self.audioBuffer.count)"
-            )
-
-            if self.activeAudioCaptureBackend == .audioEngine,
-               let currentDevice = self.getCurrentlyBoundInputDevice()
-            {
-                self.startMonitoringDevice(currentDevice.id)
-            }
-
-            DebugLogger.shared.info(
-                "Audio route recovery succeeded (generation=\(request.generation))",
-                source: "ASRService"
+            throw NSError(
+                domain: "ASRService",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "No replacement microphone is available."]
             )
         } catch {
             guard request.generation == self.audioRouteRecoveryGeneration, Task.isCancelled == false else { return }
@@ -2992,6 +3186,7 @@ final class ASRService: ObservableObject {
                 reason: "active_route_recovery_failed"
             )
             DebugLogger.shared.error("Audio route recovery failed: \(error)", source: "ASRService")
+            AppServices.shared.microphonePreferenceCoordinator.markActiveSelectionUnavailable()
 
             // Avoid asking stopWithoutTranscription() to await the recovery task
             // that is currently executing this catch block.
@@ -3029,6 +3224,7 @@ final class ASRService: ObservableObject {
                 "device=\(invalidation.deviceID) property=\(invalidation.reason) " +
                 "wasRunning=\(invalidation.wasRunning) isStarting=\(self.isStarting)"
         )
+        AppServices.shared.audioObserver.signalInputAvailabilityChanged()
         if invalidation.reason == "audio_service_restarted" {
             self.reestablishAudioHardwareListenersAfterServiceReset()
             AppServices.shared.audioObserver.restartObservingAfterAudioServiceReset()
@@ -3045,8 +3241,8 @@ final class ASRService: ObservableObject {
     }
 
     private func handleDefaultInputChanged() {
-        // FluidVoice owns only its app-specific input selection. A macOS
-        // default-input change must not move or restart the selected mic.
+        // Microphone priority is app-owned. A macOS default-input change must
+        // never move or restart FluidVoice's selected microphone.
     }
 
     private func handleDefaultOutputChanged() {
@@ -3296,23 +3492,38 @@ final class ASRService: ObservableObject {
         // the HAL may still be settling, and synchronous queries on main can deadlock.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let currentDevices = AudioDevice.listInputDevices()
+            let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let cachedUIDs = self.cachedDeviceUIDs
+                let cachedDeviceIDsByUID = self.cachedInputDeviceIDsByUID
                 let currentUIDs = Set(currentDevices.map(\.uid))
+                let currentDeviceIDsByUID = Dictionary(
+                    currentDevices.map { ($0.uid, $0.id) },
+                    uniquingKeysWith: { current, _ in current }
+                )
 
                 DebugLogger.shared.debug("Current input devices: \(currentDevices.map { $0.name }.joined(separator: ", "))", source: "ASRService")
 
-                if currentUIDs != cachedUIDs {
-                    let previousPreferredUID = SettingsStore.shared.preferredInputDeviceUID
+                if currentUIDs != cachedUIDs || currentDeviceIDsByUID != cachedDeviceIDsByUID {
                     let microphonePreferenceCoordinator =
                         AppServices.shared.microphonePreferenceCoordinator
+                    let migrationPending = microphonePreferenceCoordinator.needsMicrophonePriorityMigration
+                    microphonePreferenceCoordinator.reconcileMicrophoneSelection(
+                        availableInputs: currentDevices,
+                        defaultInputUID: defaultInputUID
+                    )
+                    let priorityUIDs = SettingsStore.shared.microphonePriority.map(\.uid)
                     let shouldReconcileInputSelection = AudioCaptureIdlePolicy.shouldReconcileInputSelection(
-                        preferredInputUID: previousPreferredUID,
-                        migrationPending: microphonePreferenceCoordinator.needsAppOnlySelectionMigration,
+                        priorityInputUIDs: priorityUIDs,
+                        migrationPending: migrationPending,
                         previousInputUIDs: cachedUIDs,
                         currentInputUIDs: currentUIDs
+                    ) || AudioCaptureIdlePolicy.didResolvedPriorityInputIdentityChange(
+                        priorityInputUIDs: priorityUIDs,
+                        previousInputDeviceIDsByUID: cachedDeviceIDsByUID,
+                        currentInputDeviceIDsByUID: currentDeviceIDsByUID
                     )
                     if shouldReconcileInputSelection {
                         self.scheduleAudioRouteRecovery(
@@ -3404,9 +3615,14 @@ final class ASRService: ObservableObject {
 
     /// Device caching for change detection
     private var cachedDeviceUIDs: Set<String> = []
+    private var cachedInputDeviceIDsByUID: [String: AudioObjectID] = [:]
 
     private func cacheCurrentDeviceList(_ devices: [AudioDevice.Device]) {
         self.cachedDeviceUIDs = Set(devices.map { $0.uid })
+        self.cachedInputDeviceIDsByUID = Dictionary(
+            devices.map { ($0.uid, $0.id) },
+            uniquingKeysWith: { current, _ in current }
+        )
     }
 
     // Audio tap processing is handled by AudioCapturePipeline (thread-safe).
