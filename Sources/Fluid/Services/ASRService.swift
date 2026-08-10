@@ -1654,13 +1654,25 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.warning("START() blocked - app is terminating", source: "ASRService")
             return .failed
         }
-        if self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled {
-            await self.stopMicrophonePreview()
-        }
         self.audioCaptureStartGeneration &+= 1
         let startGeneration = self.audioCaptureStartGeneration
         self.isStarting = true
         defer { self.finishAudioCaptureStart() }
+
+        // Reserve the start before preview teardown yields. Press-and-hold release
+        // must be able to see and cancel this handoff before capture hardware starts.
+        if self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled {
+            await self.stopMicrophonePreview()
+            guard startGeneration == self.audioCaptureStartGeneration,
+                  self.isTerminating == false
+            else {
+                DebugLogger.shared.debug(
+                    "Audio capture start cancelled during microphone preview handoff",
+                    source: "ASRService"
+                )
+                return .failed
+            }
+        }
 
         // Reset media pause state for this session
         self.didPauseMediaForThisSession = false
