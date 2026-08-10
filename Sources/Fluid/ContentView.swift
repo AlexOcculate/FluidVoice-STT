@@ -1519,7 +1519,7 @@ struct ContentView: View {
         // Query CoreAudio off the main thread — during device topology changes, synchronous
         // CoreAudio calls on main can deadlock while the HAL is still settling.
         DispatchQueue.global(qos: .userInitiated).async {
-            let inputs = AudioDevice.listInputDevices()
+            let inputs = AudioDevice.listInputDevicesRefreshingLiveness()
             let outputs = AudioDevice.listOutputDevices()
             let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
             DispatchQueue.main.async {

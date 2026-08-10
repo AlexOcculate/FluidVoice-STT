@@ -606,8 +606,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         loadingItem.isEnabled = false
         submenu.addItem(loadingItem)
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let inputDevices = AudioDevice.listInputDevices()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let inputDevices = AudioDevice.listInputDevicesRefreshingLiveness()
             let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
 
             DispatchQueue.main.async { [weak self] in

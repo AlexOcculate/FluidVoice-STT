@@ -1370,7 +1370,7 @@ final class ASRService: ObservableObject {
 
         let initialInputSnapshot = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let devices = AudioDevice.listInputDevices()
+                let devices = AudioDevice.listInputDevicesRefreshingLiveness()
                 let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
                 continuation.resume(returning: (devices, defaultInputUID))
             }
@@ -2998,7 +2998,7 @@ final class ASRService: ObservableObject {
     ) async -> Bool {
         let snapshot = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let devices = AudioDevice.listInputDevices()
+                let devices = AudioDevice.listInputDevicesRefreshingLiveness()
                 let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
                 continuation.resume(returning: (devices, defaultInputUID))
             }
@@ -3504,30 +3504,43 @@ final class ASRService: ObservableObject {
         // Perform CoreAudio queries off the main thread — during a device topology change
         // the HAL may still be settling, and synchronous queries on main can deadlock.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let currentDevices = AudioDevice.listInputDevices()
+            let currentDevices = AudioDevice.listInputDevicesRefreshingLiveness()
             let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let cachedUIDs = self.cachedDeviceUIDs
                 let cachedDeviceIDsByUID = self.cachedInputDeviceIDsByUID
+                let cachedLivenessByUID = self.cachedInputLivenessByUID
                 let currentUIDs = Set(currentDevices.map(\.uid))
                 let currentDeviceIDsByUID = Dictionary(
                     currentDevices.map { ($0.uid, $0.id) },
                     uniquingKeysWith: { current, _ in current }
                 )
+                let currentLivenessByUID = Dictionary(
+                    currentDevices.map { ($0.uid, $0.isAlive) },
+                    uniquingKeysWith: { current, _ in current }
+                )
 
                 DebugLogger.shared.debug("Current input devices: \(currentDevices.map { $0.name }.joined(separator: ", "))", source: "ASRService")
 
-                if currentUIDs != cachedUIDs || currentDeviceIDsByUID != cachedDeviceIDsByUID {
+                if currentUIDs != cachedUIDs ||
+                    currentDeviceIDsByUID != cachedDeviceIDsByUID ||
+                    currentLivenessByUID != cachedLivenessByUID
+                {
                     let microphonePreferenceCoordinator =
                         AppServices.shared.microphonePreferenceCoordinator
                     let migrationPending = microphonePreferenceCoordinator.needsMicrophonePriorityMigration
-                    microphonePreferenceCoordinator.reconcileMicrophoneSelection(
+                    let resolvedInput = microphonePreferenceCoordinator.reconcileMicrophoneSelection(
                         availableInputs: currentDevices,
                         defaultInputUID: defaultInputUID
                     )
                     let priorityUIDs = SettingsStore.shared.microphonePriority.map(\.uid)
+                    let livenessRequiresRecovery =
+                        (self.isRunning &&
+                            resolvedInput?.uid != microphonePreferenceCoordinator.confirmedActiveInputUID) ||
+                        (self.hasPreparedAudioCapture &&
+                            resolvedInput?.id != self.directAudioLifecycleController.snapshot.deviceID)
                     let shouldReconcileInputSelection = AudioCaptureIdlePolicy.shouldReconcileInputSelection(
                         priorityInputUIDs: priorityUIDs,
                         migrationPending: migrationPending,
@@ -3537,7 +3550,7 @@ final class ASRService: ObservableObject {
                         priorityInputUIDs: priorityUIDs,
                         previousInputDeviceIDsByUID: cachedDeviceIDsByUID,
                         currentInputDeviceIDsByUID: currentDeviceIDsByUID
-                    )
+                    ) || livenessRequiresRecovery
                     if shouldReconcileInputSelection {
                         self.scheduleAudioRouteRecovery(
                             reason: "app microphone availability changed",
@@ -3555,21 +3568,20 @@ final class ASRService: ObservableObject {
     /// Handles device availability changes (device disconnected or reconnected)
     private func handleDeviceAvailabilityChanged(deviceID: AudioObjectID) {
         DebugLogger.shared.info("⚠️ Device availability changed for ID: \(deviceID)", source: "ASRService")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let isAlive = AudioDevice.refreshInputDeviceLiveness(deviceID: deviceID)
+            DispatchQueue.main.async { [weak self] in
+                self?.applyDeviceAvailability(isAlive: isAlive, deviceID: deviceID)
+            }
+        }
+    }
 
-        // Check if device is still alive
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsAlive,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+    private func applyDeviceAvailability(isAlive: Bool, deviceID: AudioObjectID) {
+        DebugLogger.shared.debug(
+            "Device \(deviceID) cached alive status: \(isAlive)",
+            source: "ASRService"
         )
-
-        var isAlive: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &isAlive)
-
-        DebugLogger.shared.debug("Device \(deviceID) alive status query: status=\(status), isAlive=\(isAlive)", source: "ASRService")
-
-        if status == noErr, isAlive == 0 {
+        if isAlive == false {
             // Device disconnected
             DebugLogger.shared.warning("❌ Monitored device (ID: \(deviceID)) DISCONNECTED", source: "ASRService")
             self.stopMonitoringDevice()
@@ -3586,7 +3598,7 @@ final class ASRService: ObservableObject {
             } else {
                 DebugLogger.shared.info("Not recording - device disconnect handled gracefully", source: "ASRService")
             }
-        } else if status == noErr, isAlive != 0 {
+        } else {
             DebugLogger.shared.info("✅ Device (ID: \(deviceID)) is still alive", source: "ASRService")
         }
     }
@@ -3629,11 +3641,16 @@ final class ASRService: ObservableObject {
     /// Device caching for change detection
     private var cachedDeviceUIDs: Set<String> = []
     private var cachedInputDeviceIDsByUID: [String: AudioObjectID] = [:]
+    private var cachedInputLivenessByUID: [String: Bool] = [:]
 
     private func cacheCurrentDeviceList(_ devices: [AudioDevice.Device]) {
         self.cachedDeviceUIDs = Set(devices.map { $0.uid })
         self.cachedInputDeviceIDsByUID = Dictionary(
             devices.map { ($0.uid, $0.id) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        self.cachedInputLivenessByUID = Dictionary(
+            devices.map { ($0.uid, $0.isAlive) },
             uniquingKeysWith: { current, _ in current }
         )
     }

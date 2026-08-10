@@ -21,6 +21,7 @@ nonisolated enum AudioDevice {
         let hasInput: Bool
         let hasOutput: Bool
         let transportType: UInt32
+        let isAlive: Bool
 
         init(
             id: AudioObjectID,
@@ -28,7 +29,8 @@ nonisolated enum AudioDevice {
             name: String,
             hasInput: Bool,
             hasOutput: Bool,
-            transportType: UInt32 = kAudioDeviceTransportTypeUnknown
+            transportType: UInt32 = kAudioDeviceTransportTypeUnknown,
+            isAlive: Bool = true
         ) {
             self.id = id
             self.uid = uid
@@ -36,6 +38,7 @@ nonisolated enum AudioDevice {
             self.hasInput = hasInput
             self.hasOutput = hasOutput
             self.transportType = transportType
+            self.isAlive = isAlive
         }
 
         var isBluetooth: Bool {
@@ -47,6 +50,39 @@ nonisolated enum AudioDevice {
             self.transportType == kAudioDeviceTransportTypeBuiltIn
         }
     }
+
+    private struct InputLivenessKey: Hashable {
+        let id: AudioObjectID
+        let uid: String
+    }
+
+    private final class InputLivenessCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [InputLivenessKey: Bool] = [:]
+
+        func snapshot() -> [InputLivenessKey: Bool] {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.values
+        }
+
+        func replace(with values: [InputLivenessKey: Bool]) {
+            self.lock.lock()
+            self.values = values
+            self.lock.unlock()
+        }
+
+        func update(deviceID: AudioObjectID, isAlive: Bool) {
+            self.lock.lock()
+            let matchingKeys = self.values.keys.filter { $0.id == deviceID }
+            for key in matchingKeys {
+                self.values[key] = isAlive
+            }
+            self.lock.unlock()
+        }
+    }
+
+    private static let inputLivenessCache = InputLivenessCache()
 
     static func listAllDevices() -> [Device] {
         var address = AudioObjectPropertyAddress(
@@ -84,6 +120,7 @@ nonisolated enum AudioDevice {
             return []
         }
 
+        let cachedInputLiveness = self.inputLivenessCache.snapshot()
         var devices: [Device] = []
         devices.reserveCapacity(deviceIDs.count)
 
@@ -104,7 +141,10 @@ nonisolated enum AudioDevice {
                     name: name,
                     hasInput: hasIn,
                     hasOutput: hasOut,
-                    transportType: transportType
+                    transportType: transportType,
+                    isAlive: cachedInputLiveness[
+                        InputLivenessKey(id: devId, uid: uid)
+                    ] ?? true
                 )
             )
         }
@@ -114,6 +154,40 @@ nonisolated enum AudioDevice {
 
     static func listInputDevices() -> [Device] {
         return self.listAllDevices().filter { $0.hasInput }
+    }
+
+    /// Refreshes the HAL liveness snapshot. Call only from an existing background
+    /// hardware-refresh path; UI and capture selection consume the cached value.
+    static func listInputDevicesRefreshingLiveness() -> [Device] {
+        let devices = self.listInputDevices()
+        let liveness = Dictionary(
+            uniqueKeysWithValues: devices.map { device in
+                (
+                    InputLivenessKey(id: device.id, uid: device.uid),
+                    self.queryInputDeviceLiveness(device.id)
+                )
+            }
+        )
+        self.inputLivenessCache.replace(with: liveness)
+        return devices.map { device in
+            Device(
+                id: device.id,
+                uid: device.uid,
+                name: device.name,
+                hasInput: device.hasInput,
+                hasOutput: device.hasOutput,
+                transportType: device.transportType,
+                isAlive: liveness[InputLivenessKey(id: device.id, uid: device.uid)] ?? true
+            )
+        }
+    }
+
+    /// Refreshes one monitored device without blocking the listener's main queue.
+    /// Callers must invoke this from a background hardware-refresh path.
+    static func refreshInputDeviceLiveness(deviceID: AudioObjectID) -> Bool {
+        let isAlive = self.queryInputDeviceLiveness(deviceID)
+        self.inputLivenessCache.update(deviceID: deviceID, isAlive: isAlive)
+        return isAlive
     }
 
     static func listOutputDevices() -> [Device] {
@@ -147,10 +221,14 @@ nonisolated enum AudioDevice {
         return self.listInputDevices().first { $0.uid == uid }
     }
 
-    /// Core Audio may continue enumerating an input after it has stopped being usable,
-    /// notably the internal microphone during some clamshell transitions.
-    /// Fail open when the property cannot be queried so unusual/virtual devices still work.
+    /// Reads the liveness value captured by the latest background hardware refresh.
     static func isInputDeviceAlive(_ device: Device) -> Bool {
+        device.isAlive
+    }
+
+    /// Core Audio may continue enumerating an input after it has stopped being usable.
+    /// Fail open when HAL cannot answer so unusual and virtual devices still work.
+    private static func queryInputDeviceLiveness(_ deviceID: AudioObjectID) -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceIsAlive,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -159,7 +237,7 @@ nonisolated enum AudioDevice {
         var value: UInt32 = 1
         var dataSize = UInt32(MemoryLayout<UInt32>.size)
         let status = AudioObjectGetPropertyData(
-            device.id,
+            deviceID,
             &address,
             0,
             nil,
@@ -487,7 +565,7 @@ final class AudioHardwareObserver: ObservableObject {
         self.inputAvailabilityRefreshGeneration &+= 1
         let generation = self.inputAvailabilityRefreshGeneration
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let devices = AudioDevice.listInputDevices()
+            let devices = AudioDevice.listInputDevicesRefreshingLiveness()
             DispatchQueue.main.async { [weak self] in
                 guard let self,
                       self.inputAvailabilityRefreshGeneration == generation
@@ -511,15 +589,18 @@ final class AudioHardwareObserver: ObservableObject {
             var address = Self.inputAvailabilityAddress
             let token: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 // Never query Core Audio synchronously from its property callback.
-                // Hop to the next main-queue turn before observers resolve priority.
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.changeTick &+= 1
-                    NotificationCenter.default.post(
-                        name: .inputDeviceAvailabilityDidChange,
-                        object: self,
-                        userInfo: ["deviceID": deviceID]
-                    )
+                // Refresh the cached snapshot off-main before observers resolve priority.
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    _ = AudioDevice.listInputDevicesRefreshingLiveness()
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.changeTick &+= 1
+                        NotificationCenter.default.post(
+                            name: .inputDeviceAvailabilityDidChange,
+                            object: self,
+                            userInfo: ["deviceID": deviceID]
+                        )
+                    }
                 }
             }
             let status = AudioObjectAddPropertyListenerBlock(

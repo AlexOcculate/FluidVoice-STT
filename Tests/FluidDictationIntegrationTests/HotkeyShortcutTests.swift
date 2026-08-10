@@ -980,6 +980,19 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
+    func testInputDeviceLivenessUsesSnapshotWithoutQueryingHAL() {
+        let unavailable = AudioDevice.Device(
+            id: 42,
+            uid: "unavailable",
+            name: "Unavailable Microphone",
+            hasInput: true,
+            hasOutput: false,
+            isAlive: false
+        )
+
+        XCTAssertFalse(AudioDevice.isInputDeviceAlive(unavailable))
+    }
+
     @MainActor
     func testClamshellSkipsEnumeratedUnusableBuiltInMicrophone() throws {
         try self.withRestoredDefaults(keys: [
