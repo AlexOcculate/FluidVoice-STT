@@ -545,9 +545,14 @@ final class HotkeyShortcutTests: XCTestCase {
     @MainActor
     func testMicrophoneMigrationWaitsForAUsableDeviceList() throws {
         try self.withRestoredDefaults(keys: [
+            self.microphoneSelectionModeKey,
             self.preferredInputDeviceUIDKey,
             self.microphoneSelectionMigrationVersionKey,
         ]) {
+            UserDefaults.standard.set(
+                SettingsStore.MicrophoneSelectionMode.system.rawValue,
+                forKey: self.microphoneSelectionModeKey
+            )
             SettingsStore.shared.preferredInputDeviceUID = "airpods"
             SettingsStore.shared.microphoneSelectionMigrationVersion = 0
             let devices = FakeAudioDeviceManager(inputs: [], defaultInputUID: nil)
@@ -593,9 +598,14 @@ final class HotkeyShortcutTests: XCTestCase {
     @MainActor
     func testMicrophoneMigrationWithoutBuiltInReplacesMissingSelectionWithDefault() throws {
         try self.withRestoredDefaults(keys: [
+            self.microphoneSelectionModeKey,
             self.preferredInputDeviceUIDKey,
             self.microphoneSelectionMigrationVersionKey,
         ]) {
+            UserDefaults.standard.set(
+                SettingsStore.MicrophoneSelectionMode.system.rawValue,
+                forKey: self.microphoneSelectionModeKey
+            )
             SettingsStore.shared.preferredInputDeviceUID = "internal"
             SettingsStore.shared.microphoneSelectionMigrationVersion = 0
             let devices = FakeAudioDeviceManager(
