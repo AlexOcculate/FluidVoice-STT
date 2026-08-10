@@ -87,10 +87,13 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
         let enumeratedPreferredInput = availableInputs.first { input in
             input.uid == self.settings.preferredInputDeviceUID
         }
+        let enumeratedDefaultInput = defaultInputUID.flatMap { uid in
+            availableInputs.first { $0.uid == uid }
+        }
         let defaultInput = defaultInputUID.flatMap { uid in
             usableInputs.first { $0.uid == uid }
         }
-        let migrationInputs = defaultInput.map { input in
+        let migrationInputs = enumeratedDefaultInput.map { input in
             [input] + availableInputs.filter { $0.uid != input.uid }
         } ?? availableInputs
         let previousMode = self.settings.storedMicSelectionModeForMigration
@@ -133,9 +136,11 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
                 ?? defaultInput
                 ?? self.fallbackInput(from: usableInputs, defaultInputUID: defaultInputUID)
         } else if migrationVersion == 0 {
-            selectedInput = defaultInput
-                ?? preferredInput
-                ?? self.fallbackInput(from: usableInputs, defaultInputUID: defaultInputUID)
+            // A fresh install must mirror macOS's selected input, not permanently
+            // promote whichever fallback happened to enumerate first at launch.
+            // If HAL has not exposed the default yet, leave migration pending;
+            // capture can still use a temporary fallback without saving it.
+            selectedInput = enumeratedDefaultInput
         } else if migrationVersion == 1,
                   let preferredInput,
                   preferredInput.isBuiltIn,
@@ -151,6 +156,11 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
                 ?? self.fallbackInput(from: usableInputs, defaultInputUID: defaultInputUID)
         }
         guard let selectedInput else {
+            if migrationVersion == 0,
+               previousMode == .system
+            {
+                return
+            }
             self.settings.reconcileMicrophonePriority(with: migrationInputs)
             return
         }

@@ -698,6 +698,91 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
+    func testFreshInstallWaitsForMacOSDefaultInsteadOfPersistingFallback() throws {
+        try self.withRestoredDefaults(keys: [
+            self.microphoneSelectionModeKey,
+            self.preferredInputDeviceUIDKey,
+            self.microphoneSelectionMigrationVersionKey,
+        ]) {
+            UserDefaults.standard.set(
+                SettingsStore.MicrophoneSelectionMode.system.rawValue,
+                forKey: self.microphoneSelectionModeKey
+            )
+            SettingsStore.shared.preferredInputDeviceUID = nil
+            SettingsStore.shared.microphoneSelectionMigrationVersion = 0
+            let fallback = Self.device(uid: "fallback", name: "Available Fallback")
+            let unsettledDevices = FakeAudioDeviceManager(
+                inputs: [fallback],
+                defaultInputUID: "system-default"
+            )
+            let unsettledCoordinator = MicrophonePreferenceCoordinator(
+                settings: .shared,
+                devices: unsettledDevices
+            )
+
+            let temporarySelection = unsettledCoordinator.reconcileMicrophoneSelection(
+                availableInputs: unsettledDevices.inputs,
+                defaultInputUID: unsettledDevices.defaultInputUID
+            )
+
+            XCTAssertEqual(temporarySelection, fallback)
+            XCTAssertTrue(SettingsStore.shared.microphonePriority.isEmpty)
+            XCTAssertNil(SettingsStore.shared.preferredInputDeviceUID)
+            XCTAssertEqual(SettingsStore.shared.microphoneSelectionMigrationVersion, 0)
+
+            let systemDefault = Self.device(uid: "system-default", name: "macOS Default")
+            let settledDevices = FakeAudioDeviceManager(
+                inputs: [fallback, systemDefault],
+                defaultInputUID: systemDefault.uid
+            )
+            let settledCoordinator = MicrophonePreferenceCoordinator(
+                settings: .shared,
+                devices: settledDevices
+            )
+
+            settledCoordinator.migrateMicrophonePriorityIfNeeded()
+
+            XCTAssertEqual(SettingsStore.shared.microphonePriority.first?.uid, systemDefault.uid)
+            XCTAssertEqual(SettingsStore.shared.preferredInputDeviceUID, systemDefault.uid)
+            XCTAssertEqual(SettingsStore.shared.microphoneSelectionMigrationVersion, 4)
+        }
+    }
+
+    @MainActor
+    func testFreshInstallPrioritizesMacOSDefaultWhileTemporarilyUnusable() throws {
+        try self.withRestoredDefaults(keys: [
+            self.microphoneSelectionModeKey,
+            self.preferredInputDeviceUIDKey,
+            self.microphoneSelectionMigrationVersionKey,
+        ]) {
+            UserDefaults.standard.set(
+                SettingsStore.MicrophoneSelectionMode.system.rawValue,
+                forKey: self.microphoneSelectionModeKey
+            )
+            SettingsStore.shared.preferredInputDeviceUID = nil
+            SettingsStore.shared.microphoneSelectionMigrationVersion = 0
+            let systemDefault = Self.device(uid: "system-default", name: "macOS Default")
+            let fallback = Self.device(uid: "fallback", name: "Available Fallback")
+            let devices = FakeAudioDeviceManager(
+                inputs: [fallback, systemDefault],
+                defaultInputUID: systemDefault.uid,
+                unusableInputUIDs: [systemDefault.uid]
+            )
+            let coordinator = MicrophonePreferenceCoordinator(settings: .shared, devices: devices)
+
+            let resolved = coordinator.reconcileMicrophoneSelection(
+                availableInputs: devices.inputs,
+                defaultInputUID: devices.defaultInputUID
+            )
+
+            XCTAssertEqual(SettingsStore.shared.microphonePriority.map(\.uid), [systemDefault.uid, fallback.uid])
+            XCTAssertEqual(SettingsStore.shared.preferredInputDeviceUID, systemDefault.uid)
+            XCTAssertEqual(resolved, fallback)
+            XCTAssertEqual(SettingsStore.shared.microphoneSelectionMigrationVersion, 4)
+        }
+    }
+
+    @MainActor
     func testMicrophoneMigrationWaitsForAUsableDeviceList() throws {
         try self.withRestoredDefaults(keys: [
             self.microphoneSelectionModeKey,

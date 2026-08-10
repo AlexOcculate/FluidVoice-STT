@@ -186,6 +186,11 @@ final class ASRService: ObservableObject {
     @Published var downloadingModelId: String? = nil // Tracks which model is currently being downloaded
     @Published private(set) var isCancellingModelDownload: Bool = false
     @Published private(set) var isDictionaryTrainingCaptureActive: Bool = false
+    @Published private(set) var isMicrophonePreviewActive: Bool = false
+    @Published private(set) var microphonePreviewError: String?
+    @Published private(set) var audioCaptureStateSettledTick: UInt64 = 0
+    private var microphonePreviewOperationGeneration: UInt64 = 0
+    private var isMicrophonePreviewRequested = false
     private(set) var lastDictionaryTrainingResult: ASRTranscriptionResult?
     private(set) var dictionaryTrainingAudioGeneration = 0
 
@@ -1488,6 +1493,122 @@ final class ASRService: ObservableObject {
         }
     }
 
+    func startMicrophonePreview() async {
+        guard self.micStatus == .authorized,
+              self.isRunning == false,
+              self.isStarting == false,
+              self.isTerminating == false
+        else { return }
+
+        self.microphonePreviewOperationGeneration &+= 1
+        let operationGeneration = self.microphonePreviewOperationGeneration
+        self.isMicrophonePreviewRequested = true
+
+        if self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled {
+            self.audioCapturePipeline.setLevelMonitoringEnabled(false)
+            _ = await self.directAudioLifecycleController.stop(
+                retainPrepared: false,
+                reason: "onboarding_microphone_preview_restart"
+            )
+            guard operationGeneration == self.microphonePreviewOperationGeneration,
+                  self.isMicrophonePreviewRequested,
+                  self.isRunning == false,
+                  self.isStarting == false,
+                  self.isTerminating == false
+            else { return }
+            self.activeAudioCaptureBackend = .none
+            self.isMicrophonePreviewActive = false
+            self.audioLevelSubject.send(0)
+        }
+
+        self.audioEngineStandbyTask?.cancel()
+        self.audioEngineStandbyTask = nil
+        await self.audioEngineRetirementDrain.waitForScheduledReleases()
+        guard operationGeneration == self.microphonePreviewOperationGeneration,
+              self.isMicrophonePreviewRequested,
+              self.isRunning == false,
+              self.isStarting == false,
+              self.isTerminating == false
+        else { return }
+        self.microphonePreviewError = nil
+        self.audioCapturePipeline.setLevelMonitoringEnabled(true)
+
+        do {
+            guard let selection = self.directCoreAudioDeviceSelection() else {
+                throw NSError(
+                    domain: "ASRService",
+                    code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "No usable microphone is available."]
+                )
+            }
+            let device = try await self.directAudioLifecycleController.resolveDevice(
+                selection: selection,
+                reason: "onboarding_microphone_preview"
+            )
+            try Task.checkCancellation()
+            guard operationGeneration == self.microphonePreviewOperationGeneration,
+                  self.isRunning == false,
+                  self.isStarting == false,
+                  self.isTerminating == false
+            else { throw CancellationError() }
+            _ = try await self.directAudioLifecycleController.start(
+                deviceID: device.id,
+                deviceName: device.name,
+                reason: "onboarding_microphone_preview"
+            )
+            try Task.checkCancellation()
+            guard operationGeneration == self.microphonePreviewOperationGeneration,
+                  self.isRunning == false,
+                  self.isStarting == false,
+                  self.isTerminating == false
+            else { throw CancellationError() }
+            self.activeAudioCaptureBackend = .directCoreAudio
+            self.isMicrophonePreviewActive = true
+            DebugLogger.shared.info(
+                "Started onboarding microphone preview with '\(device.name)'",
+                source: "ASRService"
+            )
+        } catch {
+            // A newer preview, page-exit stop, or dictation start owns cleanup
+            // after invalidating this operation. Do not tear down its capture.
+            guard operationGeneration == self.microphonePreviewOperationGeneration else {
+                return
+            }
+            self.audioCapturePipeline.setLevelMonitoringEnabled(false)
+            await self.directAudioLifecycleController.invalidate(
+                reason: "onboarding_microphone_preview_failed"
+            )
+            self.activeAudioCaptureBackend = .none
+            self.isMicrophonePreviewActive = false
+            self.isMicrophonePreviewRequested = false
+            self.microphonePreviewError = error is CancellationError ? nil : error.localizedDescription
+            guard error is CancellationError == false else { return }
+            DebugLogger.shared.warning(
+                "Onboarding microphone preview failed: \(error.localizedDescription)",
+                source: "ASRService"
+            )
+        }
+    }
+
+    func stopMicrophonePreview(retainPreparedCapture: Bool = true) async {
+        self.microphonePreviewOperationGeneration &+= 1
+        let operationGeneration = self.microphonePreviewOperationGeneration
+        self.isMicrophonePreviewRequested = false
+        guard self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled else {
+            return
+        }
+
+        self.audioCapturePipeline.setLevelMonitoringEnabled(false)
+        _ = await self.directAudioLifecycleController.stop(
+            retainPrepared: retainPreparedCapture,
+            reason: "onboarding_microphone_preview_stop"
+        )
+        guard operationGeneration == self.microphonePreviewOperationGeneration else { return }
+        self.activeAudioCaptureBackend = .none
+        self.isMicrophonePreviewActive = false
+        self.audioLevelSubject.send(0)
+    }
+
     func openSystemSettingsForMic() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
             NSWorkspace.shared.open(url)
@@ -1532,6 +1653,9 @@ final class ASRService: ObservableObject {
         guard self.isTerminating == false else {
             DebugLogger.shared.warning("START() blocked - app is terminating", source: "ASRService")
             return .failed
+        }
+        if self.isMicrophonePreviewActive || self.audioCapturePipeline.isLevelMonitoringEnabled {
+            await self.stopMicrophonePreview()
         }
         self.audioCaptureStartGeneration &+= 1
         let startGeneration = self.audioCaptureStartGeneration
@@ -1909,6 +2033,7 @@ final class ASRService: ObservableObject {
 
     private func finishAudioCaptureStart() {
         self.isStarting = false
+        self.audioCaptureStateSettledTick &+= 1
         let waiters = self.audioCaptureStartWaiters
         self.audioCaptureStartWaiters.removeAll(keepingCapacity: false)
         waiters.forEach { $0.resume() }
@@ -1998,6 +2123,7 @@ final class ASRService: ObservableObject {
 
         await self.stopActiveAudioCapture(reason: "recording_stop")
         self.audioCapturePipeline.finishRecording()
+        self.audioCaptureStateSettledTick &+= 1
 
         // A prepared direct IOProc owns only fixed memory and registration; it
         // does not run hardware, show the mic indicator, or hold Bluetooth in
@@ -2365,6 +2491,7 @@ final class ASRService: ObservableObject {
 
         // Cancel/no-transcription paths stay conservative and retire the engine.
         await self.retireAudioEngineAndWait(reason: "stop_without_transcription")
+        self.audioCaptureStateSettledTick &+= 1
 
         // CRITICAL FIX: Await completion of streaming task AND any pending transcriptions
         // This prevents use-after-free crashes (EXC_BAD_ACCESS) when clearing buffer
@@ -3028,6 +3155,8 @@ final class ASRService: ObservableObject {
     private func recoverIdleAudioRoute(_ request: AudioRouteRecoveryRequest) async {
         let shouldRebuild = self.hasPreparedAudioCapture || request.requiresIdlePrewarm
         guard shouldRebuild else { return }
+        let shouldRestoreMicrophonePreview = self.isMicrophonePreviewRequested
+        let microphonePreviewGeneration = self.microphonePreviewOperationGeneration
 
         // If another event arrives while retirement is draining, the next
         // generation still needs to restore the prepared capture backend.
@@ -3043,10 +3172,17 @@ final class ASRService: ObservableObject {
         await self.retireAudioEngineAndWait(reason: "idle_route_change:\(request.reason)")
 
         guard request.generation == self.audioRouteRecoveryGeneration, Task.isCancelled == false else { return }
-        await self.prewarmConfiguredAudioCaptureIfPossible(
-            reason: "idle_route_change",
-            allowDuringRouteRecovery: true
-        )
+        if shouldRestoreMicrophonePreview,
+           self.isMicrophonePreviewRequested,
+           microphonePreviewGeneration == self.microphonePreviewOperationGeneration
+        {
+            await self.startMicrophonePreview()
+        } else {
+            await self.prewarmConfiguredAudioCaptureIfPossible(
+                reason: "idle_route_change",
+                allowDuringRouteRecovery: true
+            )
+        }
     }
 
     private func recoverActiveAudioRoute(_ request: AudioRouteRecoveryRequest) async {
@@ -4614,6 +4750,7 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
 
     private let lock = NSLock()
     private var recordingEnabled: Bool = false
+    private var levelMonitoringEnabled: Bool = false
     private var firstAudioReported: Bool = false
     private var recordingSessionID: Int = 0
     private var recordingAttemptID: UInt64 = 0
@@ -4677,6 +4814,25 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
             self.smoothedLevel = 0.0
         }
         self.lock.unlock()
+    }
+
+    var isLevelMonitoringEnabled: Bool {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return self.levelMonitoringEnabled
+    }
+
+    func setLevelMonitoringEnabled(_ enabled: Bool) {
+        self.lock.lock()
+        self.levelMonitoringEnabled = enabled
+        if enabled == false, self.recordingEnabled == false {
+            self.levelHistory.removeAll(keepingCapacity: true)
+            self.smoothedLevel = 0
+        }
+        self.lock.unlock()
+        if enabled == false {
+            self.onLevel(0)
+        }
     }
 
     /// Sets the exact last acquisition time accepted for the current session.
@@ -4745,8 +4901,15 @@ private final nonisolated class AudioCapturePipeline: @unchecked Sendable {
         }
 
         self.lock.lock()
-        guard self.recordingEnabled else {
+        let recordingEnabled = self.recordingEnabled
+        let levelMonitoringEnabled = self.levelMonitoringEnabled
+        guard recordingEnabled || levelMonitoringEnabled else {
             self.lock.unlock()
+            return
+        }
+        if recordingEnabled == false {
+            self.lock.unlock()
+            self.onLevel(self.calculateAudioLevel(samples))
             return
         }
         let startHostTime = self.recordingStartHostTime

@@ -652,6 +652,15 @@ struct OnboardingFlowView: View {
     @State private var hoveredModelRouteID: String?
     @State private var hoveredModelActionButtonID: String?
     @State private var hoveredPermissionButtonID: String?
+    @State private var onboardingInputDevices: [AudioDevice.Device] = []
+    @State private var selectedOnboardingInputUID = ""
+    @State private var previewedOnboardingInputUID: String?
+    @State private var onboardingMicrophoneLevel: CGFloat = 0
+    @State private var lastOnboardingMicrophoneLevelUpdate: TimeInterval = 0
+    @State private var microphonePreviewTask: Task<Void, Never>?
+    @State private var microphonePreviewGeneration: UInt64 = 0
+    @State private var onboardingMicrophoneRefreshGeneration: UInt64 = 0
+    @State private var isOnboardingFlowVisible = false
     @State private var hoveredFooterButton: OnboardingFooterButton?
     @State private var isShowingAllLanguages = false
     @State private var isShowingOtherModelRoutes = false
@@ -936,10 +945,14 @@ struct OnboardingFlowView: View {
             }
         }
         .onAppear {
+            self.isOnboardingFlowVisible = true
             self.syncOnboardingSelectionFromSettings()
             self.playLandingWelcomeSoundIfNeeded()
             Task { @MainActor in
                 self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+                if self.step == .permissions, self.isMicrophoneReady {
+                    self.refreshOnboardingMicrophones(startPreview: true)
+                }
                 await self.asr.checkIfModelsExistAsync()
             }
         }
@@ -947,14 +960,70 @@ struct OnboardingFlowView: View {
             if self.step != .voiceModel {
                 self.cancelOnboardingModelPreparation()
             }
+            if self.step == .permissions, self.isMicrophoneReady {
+                self.refreshOnboardingMicrophones(startPreview: true)
+            } else {
+                self.stopOnboardingMicrophonePreview()
+            }
             self.playLandingWelcomeSoundIfNeeded()
         }
+        .onChange(of: self.isMicrophoneReady) { _, isReady in
+            guard self.step == .permissions else { return }
+            if isReady {
+                self.refreshOnboardingMicrophones(startPreview: true)
+            } else {
+                self.stopOnboardingMicrophonePreview()
+            }
+        }
+        .onChange(of: self.asr.isStarting) { _, isStarting in
+            guard self.isOnboardingFlowVisible,
+                  self.step == .permissions,
+                  self.isMicrophoneReady
+            else { return }
+            if isStarting {
+                self.suspendOnboardingMicrophonePreviewForDictation()
+            }
+        }
+        .onChange(of: self.asr.audioCaptureStateSettledTick) { _, _ in
+            guard self.isOnboardingFlowVisible,
+                  self.step == .permissions,
+                  self.isMicrophoneReady
+            else { return }
+            if self.asr.isRunning || self.asr.isStarting {
+                self.suspendOnboardingMicrophonePreviewForDictation()
+            } else {
+                self.refreshOnboardingMicrophones(startPreview: true)
+            }
+        }
         .onDisappear {
+            self.isOnboardingFlowVisible = false
+            self.onboardingMicrophoneRefreshGeneration &+= 1
             self.cancelOnboardingModelPreparation()
+            self.stopOnboardingMicrophonePreview()
+        }
+        .onReceive(self.asr.audioLevelPublisher) { level in
+            guard self.step == .permissions, self.isMicrophoneReady else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard level == 0 || now - self.lastOnboardingMicrophoneLevelUpdate >= 0.05 else {
+                return
+            }
+            self.lastOnboardingMicrophoneLevelUpdate = now
+            self.onboardingMicrophoneLevel = level
+        }
+        .onChange(of: self.appServices.audioObserver.changeTick) { _, _ in
+            guard self.step == .permissions, self.isMicrophoneReady else { return }
+            self.refreshOnboardingMicrophones(startPreview: true)
+        }
+        .onChange(of: self.appServices.audioObserver.inputAvailabilityTick) { _, _ in
+            guard self.step == .permissions, self.isMicrophoneReady else { return }
+            self.refreshOnboardingMicrophones(startPreview: true)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             self.syncOnboardingSelectionFromSettings()
             self.asr.micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+            if self.step == .permissions, self.isMicrophoneReady {
+                self.refreshOnboardingMicrophones(startPreview: true)
+            }
         }
     }
 
@@ -1696,15 +1765,26 @@ struct OnboardingFlowView: View {
                             VStack(spacing: 14) {
                                 self.permissionRow(
                                     stepNumber: 1,
-                                    title: self.isMicrophoneReady ? "Microphone is ready" : "Allow microphone",
+                                    title: self.isMicrophoneReady ? "Microphone access allowed" : "Allow microphone",
                                     subtitle: self.isMicrophoneReady
-                                        ? "FluidVoice can hear your dictation."
+                                        ? "Choose the microphone you want FluidVoice to use."
                                         : "macOS will ask once. Click Allow to start dictating.",
                                     systemImage: "mic.fill",
                                     isReady: self.isMicrophoneReady,
                                     actionTitle: self.microphoneActionButtonTitle
                                 ) {
                                     self.handleMicrophoneAction()
+                                }
+
+                                if self.isMicrophoneReady {
+                                    OnboardingMicrophoneSetupPanel(
+                                        devices: self.orderedOnboardingInputDevices,
+                                        selectedUID: self.selectedOnboardingInputUID,
+                                        level: self.onboardingMicrophoneLevel,
+                                        errorMessage: self.asr.microphonePreviewError,
+                                        onSelect: { self.selectOnboardingMicrophone(uid: $0) }
+                                    )
+                                    .transition(.opacity.combined(with: .move(edge: .top)))
                                 }
 
                                 self.permissionRow(
@@ -2566,6 +2646,17 @@ struct OnboardingFlowView: View {
         )
     }
 
+    private var orderedOnboardingInputDevices: [AudioDevice.Device] {
+        let devicesByUID = Dictionary(
+            self.onboardingInputDevices.map { ($0.uid, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        var ordered = self.settings.microphonePriority.compactMap { devicesByUID[$0.uid] }
+        let knownUIDs = Set(ordered.map(\.uid))
+        ordered.append(contentsOf: self.onboardingInputDevices.filter { !knownUIDs.contains($0.uid) })
+        return ordered
+    }
+
     private func isOnboardingRouteSelected(_ route: VoiceEngineLanguageRoute) -> Bool {
         self.selectedOnboardingRoute?.id == route.id || self.isRouteSelectedInSettings(route)
     }
@@ -2717,5 +2808,227 @@ struct OnboardingFlowView: View {
             return
         }
         self.goNext()
+    }
+}
+
+private extension OnboardingFlowView {
+    func refreshOnboardingMicrophones(startPreview: Bool) {
+        guard self.isOnboardingFlowVisible else { return }
+        self.onboardingMicrophoneRefreshGeneration &+= 1
+        let generation = self.onboardingMicrophoneRefreshGeneration
+        let suppressedUIDs = self.settings.suppressedMicrophoneUIDs
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let inputs = AudioDevice.listInputDevicesRefreshingLiveness()
+            let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
+            let usableInputs = inputs.filter { device in
+                suppressedUIDs.contains(device.uid) == false && AudioDevice.isInputDeviceUsable(device)
+            }
+
+            DispatchQueue.main.async {
+                guard generation == self.onboardingMicrophoneRefreshGeneration,
+                      self.isOnboardingFlowVisible,
+                      self.step == .permissions,
+                      self.isMicrophoneReady
+                else { return }
+
+                let selectedInput = self.appServices.microphonePreferenceCoordinator
+                    .reconcileMicrophoneSelection(
+                        availableInputs: inputs,
+                        defaultInputUID: defaultInputUID
+                    )
+                self.onboardingInputDevices = usableInputs
+                self.selectedOnboardingInputUID = selectedInput?.uid ?? usableInputs.first?.uid ?? ""
+
+                if startPreview {
+                    self.startOnboardingMicrophonePreviewIfNeeded()
+                }
+            }
+        }
+    }
+
+    func selectOnboardingMicrophone(uid: String) {
+        guard let device = self.onboardingInputDevices.first(where: { $0.uid == uid }) else {
+            return
+        }
+
+        self.settings.recordInputDeviceSelection(device.uid, name: device.name)
+        self.selectedOnboardingInputUID = device.uid
+        self.onboardingMicrophoneLevel = 0
+        self.lastOnboardingMicrophoneLevelUpdate = 0
+        self.startOnboardingMicrophonePreviewIfNeeded(forceRestart: true)
+    }
+
+    func startOnboardingMicrophonePreviewIfNeeded(forceRestart: Bool = false) {
+        guard self.step == .permissions,
+              self.isOnboardingFlowVisible,
+              self.isMicrophoneReady,
+              self.selectedOnboardingInputUID.isEmpty == false
+        else { return }
+        if forceRestart == false,
+           self.previewedOnboardingInputUID == self.selectedOnboardingInputUID,
+           self.asr.isMicrophonePreviewActive || self.microphonePreviewTask != nil
+        {
+            return
+        }
+
+        let selectedUID = self.selectedOnboardingInputUID
+        self.microphonePreviewGeneration &+= 1
+        let generation = self.microphonePreviewGeneration
+        self.microphonePreviewTask?.cancel()
+        self.previewedOnboardingInputUID = selectedUID
+        self.microphonePreviewTask = Task { @MainActor in
+            await self.asr.stopMicrophonePreview(retainPreparedCapture: false)
+            guard generation == self.microphonePreviewGeneration,
+                  Task.isCancelled == false,
+                  self.step == .permissions,
+                  self.isMicrophoneReady,
+                  self.selectedOnboardingInputUID == selectedUID
+            else {
+                if generation == self.microphonePreviewGeneration {
+                    self.microphonePreviewTask = nil
+                }
+                return
+            }
+
+            await self.asr.startMicrophonePreview()
+            guard generation == self.microphonePreviewGeneration,
+                  Task.isCancelled == false,
+                  self.step == .permissions,
+                  self.selectedOnboardingInputUID == selectedUID
+            else {
+                if generation == self.microphonePreviewGeneration {
+                    await self.asr.stopMicrophonePreview()
+                    self.microphonePreviewTask = nil
+                }
+                return
+            }
+            if self.asr.isMicrophonePreviewActive == false {
+                self.previewedOnboardingInputUID = nil
+            }
+            self.microphonePreviewTask = nil
+        }
+    }
+
+    func stopOnboardingMicrophonePreview() {
+        self.microphonePreviewGeneration &+= 1
+        let generation = self.microphonePreviewGeneration
+        self.microphonePreviewTask?.cancel()
+        self.microphonePreviewTask = Task { @MainActor in
+            await self.asr.stopMicrophonePreview()
+            guard generation == self.microphonePreviewGeneration else { return }
+            self.onboardingMicrophoneLevel = 0
+            self.lastOnboardingMicrophoneLevelUpdate = 0
+            self.previewedOnboardingInputUID = nil
+            self.microphonePreviewTask = nil
+        }
+    }
+
+    func suspendOnboardingMicrophonePreviewForDictation() {
+        self.microphonePreviewGeneration &+= 1
+        self.microphonePreviewTask?.cancel()
+        self.microphonePreviewTask = nil
+        self.onboardingMicrophoneLevel = 0
+        self.lastOnboardingMicrophoneLevelUpdate = 0
+        self.previewedOnboardingInputUID = nil
+    }
+}
+
+private struct OnboardingMicrophoneSetupPanel: View {
+    let devices: [AudioDevice.Device]
+    let selectedUID: String
+    let level: CGFloat
+    let errorMessage: String?
+    let onSelect: (String) -> Void
+
+    private var status: (text: String, color: Color) {
+        if let errorMessage, errorMessage.isEmpty == false {
+            return ("Microphone unavailable", Color.orange)
+        }
+        return ("Input level", Color.white.opacity(0.52))
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        let activeBarCount = min(16, max(0, Int(ceil(self.level * 16))))
+
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                Text("Select your microphone")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.58))
+
+                Spacer(minLength: 12)
+
+                if self.devices.isEmpty {
+                    Text("No microphone available")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.orange.opacity(0.9))
+                } else {
+                    Picker(
+                        "Input microphone",
+                        selection: Binding(
+                            get: { self.selectedUID },
+                            set: self.onSelect
+                        )
+                    ) {
+                        ForEach(self.devices) { device in
+                            Text(device.name).tag(device.uid)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(width: 248)
+                    .tint(.white)
+                    .accessibilityHint("Moves the selected microphone to first in FluidVoice priority")
+                }
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 62)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 18)
+
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(self.status.color)
+                    .frame(width: 6, height: 6)
+
+                Text(self.status.text)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(self.status.color)
+
+                Spacer()
+
+                HStack(spacing: 0) {
+                    ForEach(0..<16, id: \.self) { index in
+                        Capsule()
+                            .fill(
+                                index < activeBarCount
+                                    ? FluidOnboardingLandingColors.blue.opacity(0.92)
+                                    : Color.white.opacity(0.14)
+                            )
+                            .frame(width: 5, height: 15)
+
+                        if index < 15 {
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+                .frame(width: 248)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Microphone input level")
+                .accessibilityValue("\(Int((self.level * 100).rounded())) percent")
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 50)
+        }
+        .background(
+            shape
+                .fill(Color.white.opacity(0.040))
+                .overlay(shape.stroke(Color.white.opacity(0.10), lineWidth: 1))
+        )
     }
 }
