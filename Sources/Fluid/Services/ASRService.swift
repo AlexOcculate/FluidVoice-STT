@@ -1477,6 +1477,11 @@ final class ASRService: ObservableObject {
                 self.micPermissionGranted = granted
                 self.micStatus = granted ? .authorized : .denied
                 if granted {
+                    AppServices.shared.microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
+                        microphoneAuthorized: true,
+                        launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
+                            .shouldPresentStartupMicrophoneNotice ?? true
+                    )
                     await self.prewarmConfiguredAudioCaptureIfPossible(reason: "permission_granted")
                 }
             }
