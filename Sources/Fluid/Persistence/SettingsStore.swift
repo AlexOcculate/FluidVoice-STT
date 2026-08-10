@@ -2985,14 +2985,20 @@ final class SettingsStore: ObservableObject {
 
     /// Global check if a model is a reasoning model (requires special params/max_completion_tokens)
     func isReasoningModel(_ model: String) -> Bool {
-        let modelLower = model.lowercased()
+        // Drop a provider/namespace prefix (e.g. OpenRouter's "openai/") so the
+        // family checks below match prefixed reasoning IDs like "openai/o3"
+        // without also matching every non-reasoning "openai/*" model (e.g.
+        // "openai/gpt-4o"), which would strip its temperature control.
+        var modelLower = model.lowercased()
+        if let slash = modelLower.firstIndex(of: "/") {
+            modelLower = String(modelLower[modelLower.index(after: slash)...])
+        }
         return modelLower.hasPrefix("gpt-5") ||
             modelLower.contains("gpt-5.") ||
             modelLower.hasPrefix("o1") ||
             modelLower.hasPrefix("o3") ||
             modelLower.hasPrefix("o4") ||
             modelLower.contains("gpt-oss") ||
-            modelLower.hasPrefix("openai/") ||
             (modelLower.contains("deepseek") && modelLower.contains("reasoner"))
     }
 
