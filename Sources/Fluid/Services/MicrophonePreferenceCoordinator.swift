@@ -45,8 +45,6 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
     private var startupNoticeTask: Task<Void, Never>?
     private var startupNoticeEligibilityEnabled = false
     private var didPresentStartupNotice = false
-    private var startupNoticePresentedUID: String?
-    private var startupNoticePresentedName: String?
 
     init(
         settings: SettingsStore? = nil,
@@ -180,11 +178,7 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
             availableInputs: availableInputs,
             defaultInputUID: defaultInputUID
         )
-        self.lastResolvedInputUID = selectedInput?.uid
-        self.lastResolvedInputName = selectedInput?.name
-        if self.startupNoticeEligibilityEnabled {
-            self.scheduleStartupNoticeAfterSelectionSettles()
-        }
+        self.reportResolvedSelection(uid: selectedInput?.uid, name: selectedInput?.name)
         if let confirmedActiveInputUID,
            availableInputs.contains(where: { device in
                device.uid == confirmedActiveInputUID && self.isInputDeviceAvailable(device)
@@ -195,8 +189,39 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
         return selectedInput
     }
 
+    func reportResolvedSelection(uid: String?, name: String?) {
+        let previousUID = self.lastResolvedInputUID
+        let previousName = self.lastResolvedInputName
+        self.lastResolvedInputUID = uid
+        self.lastResolvedInputName = name
+
+        guard previousUID != nil, uid != previousUID else {
+            if self.startupNoticeEligibilityEnabled {
+                self.scheduleStartupNoticeAfterSelectionSettles()
+            }
+            return
+        }
+
+        if self.startupNoticeEligibilityEnabled, self.didPresentStartupNotice == false {
+            self.startupNoticeTask?.cancel()
+            self.startupNoticeTask = nil
+            self.didPresentStartupNotice = true
+        }
+
+        let notice = MicrophoneChangeNotice(
+            previousName: previousName,
+            currentName: name,
+            presentation: .selectionChange
+        )
+        DebugLogger.shared.info(
+            "Selected microphone changed from '\(notice.previousName ?? "none")' " +
+                "to '\(notice.currentName ?? "none")' before capture confirmation",
+            source: "MicrophonePreferenceCoordinator"
+        )
+        MicrophoneChangeOverlayController.shared.show(notice)
+    }
+
     func confirmActiveSelection(uid: String?, name: String?) {
-        let previousUID = self.lastConfirmedInputUID
         let previousName = self.lastConfirmedInputName
         self.lastConfirmedInputUID = uid
         self.lastConfirmedInputName = name ?? previousName
@@ -208,32 +233,8 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
                 "Confirmed active microphone as '\(name ?? "none")'",
                 source: "MicrophonePreferenceCoordinator"
             )
-            if let startupNoticePresentedUID = self.startupNoticePresentedUID,
-               uid != startupNoticePresentedUID
-            {
-                MicrophoneChangeOverlayController.shared.show(
-                    MicrophoneChangeNotice(
-                        previousName: self.startupNoticePresentedName,
-                        currentName: name,
-                        presentation: .activeChange
-                    )
-                )
-            }
             return
         }
-        guard uid != previousUID else { return }
-
-        let notice = MicrophoneChangeNotice(
-            previousName: previousName,
-            currentName: name,
-            presentation: .activeChange
-        )
-        DebugLogger.shared.info(
-            "Active microphone changed from '\(notice.previousName ?? "none")' " +
-                "to '\(notice.currentName ?? "none")' after first PCM",
-            source: "MicrophonePreferenceCoordinator"
-        )
-        MicrophoneChangeOverlayController.shared.show(notice)
     }
 
     func markActiveSelectionUnavailable() {
@@ -288,8 +289,6 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
             else { return }
             self.startupNoticeTask = nil
             self.didPresentStartupNotice = true
-            self.startupNoticePresentedUID = expectedUID
-            self.startupNoticePresentedName = currentName
             MicrophoneChangeOverlayController.shared.show(
                 MicrophoneChangeNotice(
                     previousName: nil,

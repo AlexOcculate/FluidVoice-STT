@@ -228,6 +228,7 @@ final class DictionaryCorrectionOverlayController {
 
 enum MicrophoneChangePresentation: Hashable {
     case startupSelection
+    case selectionChange
     case activeChange
 }
 
@@ -486,6 +487,9 @@ private struct MicrophoneChangeOverlayView: View {
         }
         if self.notice.presentation == .startupSelection {
             return "FluidVoice will try this microphone first when you dictate."
+        }
+        if self.notice.presentation == .selectionChange {
+            return "FluidVoice selected this microphone for capture."
         }
         return "FluidVoice confirmed this microphone is capturing audio."
     }

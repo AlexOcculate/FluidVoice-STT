@@ -996,6 +996,10 @@ final class ASRService: ObservableObject {
                 )
                 self.audioStartAttemptInputUID = device.uid
                 self.audioStartAttemptInputName = device.name
+                AppServices.shared.microphonePreferenceCoordinator.reportResolvedSelection(
+                    uid: device.uid,
+                    name: device.name
+                )
                 let snapshot = try await self.directAudioLifecycleController.start(
                     deviceID: device.id,
                     deviceName: device.name,
@@ -2528,6 +2532,10 @@ final class ASRService: ObservableObject {
     @discardableResult
     private func setEngineInputDevice(deviceID: AudioObjectID, deviceUID: String, deviceName: String) -> Bool {
         DebugLogger.shared.debug("setEngineInputDevice() - Binding input to device ID: \(deviceID)", source: "ASRService")
+        AppServices.shared.microphonePreferenceCoordinator.reportResolvedSelection(
+            uid: deviceUID,
+            name: deviceName
+        )
 
         let inputNode = self.engine.inputNode
 
