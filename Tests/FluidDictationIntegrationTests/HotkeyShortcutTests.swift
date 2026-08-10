@@ -994,6 +994,16 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
+    func testInputAvailabilitySignalDoesNotEmitGenericHardwareChange() {
+        let observer = AudioHardwareObserver()
+
+        observer.signalInputAvailabilityChanged()
+
+        XCTAssertEqual(observer.inputAvailabilityTick, 1)
+        XCTAssertEqual(observer.changeTick, 0)
+    }
+
+    @MainActor
     func testClamshellSkipsEnumeratedUnusableBuiltInMicrophone() throws {
         try self.withRestoredDefaults(keys: [
             self.microphoneSelectionModeKey,

@@ -389,6 +389,9 @@ struct ContentView: View {
                     self.selectedOutputUID = sysOut
                 }
             }
+            .onChange(of: self.audioObserver.inputAvailabilityTick) { _, _ in
+                self.refreshInputDevices()
+            }
             .onDisappear {
                 Task { await self.asr.stopWithoutTranscription() }
                 self.cancelPrewarmDictationIfNeeded()
@@ -1525,6 +1528,24 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 self.inputDevices = inputs
                 self.outputDevices = outputs
+                if let selectedInput = self.appServices.microphonePreferenceCoordinator
+                    .reconcileMicrophoneSelection(
+                        availableInputs: inputs,
+                        defaultInputUID: defaultInputUID
+                    )
+                {
+                    self.selectedInputUID = selectedInput.uid
+                }
+            }
+        }
+    }
+
+    private func refreshInputDevices() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let inputs = AudioDevice.listInputDevicesRefreshingLiveness()
+            let defaultInputUID = AudioDevice.getDefaultInputDevice()?.uid
+            DispatchQueue.main.async {
+                self.inputDevices = inputs
                 if let selectedInput = self.appServices.microphonePreferenceCoordinator
                     .reconcileMicrophoneSelection(
                         availableInputs: inputs,

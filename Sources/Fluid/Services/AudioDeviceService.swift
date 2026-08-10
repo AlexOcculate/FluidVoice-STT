@@ -400,6 +400,7 @@ final class AudioHardwareObserver: ObservableObject {
     /// Using a simple `@Published` value avoids putting `AnyPublisher`/`SubscriptionView` generics into
     /// SwiftUI's root view type, which can trigger AttributeGraph metadata-instantiation crashes at launch.
     @Published private(set) var changeTick: UInt64 = 0
+    @Published private(set) var inputAvailabilityTick: UInt64 = 0
 
     private var installed: Bool = false
     private var devicesListenerToken: AudioObjectPropertyListenerBlock?
@@ -427,7 +428,7 @@ final class AudioHardwareObserver: ObservableObject {
 
     @MainActor
     func signalInputAvailabilityChanged() {
-        self.changeTick &+= 1
+        self.inputAvailabilityTick &+= 1
     }
 
     func restartObservingAfterAudioServiceReset() {
@@ -484,7 +485,7 @@ final class AudioHardwareObserver: ObservableObject {
             self?.refreshInputAvailabilityListeners()
         }
         let defaultInToken: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.changeTick &+= 1
+            self?.inputAvailabilityTick &+= 1
         }
         let defaultOutToken: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.changeTick &+= 1
@@ -594,7 +595,7 @@ final class AudioHardwareObserver: ObservableObject {
                     _ = AudioDevice.listInputDevicesRefreshingLiveness()
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
-                        self.changeTick &+= 1
+                        self.inputAvailabilityTick &+= 1
                         NotificationCenter.default.post(
                             name: .inputDeviceAvailabilityDidChange,
                             object: self,
@@ -706,7 +707,7 @@ final class AudioHardwareObserver: ObservableObject {
         let isClosed = ClamshellState.isClosed
         guard isClosed != self.lastClamshellClosed else { return }
         self.lastClamshellClosed = isClosed
-        self.changeTick &+= 1
+        self.inputAvailabilityTick &+= 1
         DebugLogger.shared.info(
             "MacBook clamshell state changed (closed=\(isClosed))",
             source: "AudioHardwareObserver"
