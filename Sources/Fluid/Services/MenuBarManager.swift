@@ -593,6 +593,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         if menu === self.menu {
+            AnalyticsService.shared.recordAppActivity()
             self.updateMenuItemsText()
             self.refreshMicrophoneMenu()
         }

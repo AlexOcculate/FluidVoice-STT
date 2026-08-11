@@ -801,11 +801,6 @@ final class GlobalHotkeyManager: NSObject {
         case .keyDown:
             self.markOtherInputDuringModifierOnly()
 
-            // Observe post-transcription edits (do not consume the event).
-            Task {
-                await PostTranscriptionEditTracker.shared.handleKeyDown(keyCode: keyCode, modifiers: eventModifiers)
-            }
-
             // Check the configured cancel shortcut first.
             if SettingsStore.shared.cancelRecordingHotkeyShortcut.matches(keyCode: keyCode, modifiers: eventModifiers) {
                 var handled = false

@@ -703,6 +703,17 @@ struct OnboardingFlowView: View {
         case playground = 4
         case aiEnhancement = 5
 
+        var analyticsStep: AnalyticsOnboardingStep {
+            switch self {
+            case .landing: .welcome
+            case .language: .language
+            case .voiceModel: .voiceModel
+            case .permissions: .permissions
+            case .playground: .playground
+            case .aiEnhancement: .aiEnhancement
+            }
+        }
+
         var title: String {
             switch self {
             case .landing:
@@ -946,6 +957,9 @@ struct OnboardingFlowView: View {
             self.syncOnboardingSelectionFromSettings()
             self.playLandingWelcomeSoundIfNeeded()
             self.refreshOnboardingMicrophoneAuthorization(checkModels: true)
+            let origin = self.settings.analyticsOnboardingOrigin
+            AnalyticsService.shared.recordOnboardingStarted(origin: origin)
+            AnalyticsService.shared.recordOnboardingStepViewed(self.step.analyticsStep, origin: origin)
         }
         .onChange(of: self.currentStep) { _, _ in
             if self.step != .voiceModel {
@@ -957,6 +971,10 @@ struct OnboardingFlowView: View {
                 self.stopOnboardingMicrophonePreview()
             }
             self.playLandingWelcomeSoundIfNeeded()
+            AnalyticsService.shared.recordOnboardingStepViewed(
+                self.step.analyticsStep,
+                origin: self.settings.analyticsOnboardingOrigin
+            )
         }
         .onChange(of: self.isMicrophoneReady) { _, isReady in
             guard self.step == .permissions else { return }
@@ -1854,11 +1872,33 @@ struct OnboardingFlowView: View {
             onGlowExit: self.resetLandingGlow,
             onBack: self.goBack,
             onSkip: {
+                let origin = self.settings.analyticsOnboardingOrigin
                 self.markAISkipped()
                 self.finishOnboardingAtGettingStarted()
+                self.completeCurrentStep(
+                    outcome: .skipped,
+                    origin: origin,
+                    completesFlow: self.settings.onboardingCompleted
+                )
             },
-            onUseAIProvider: self.openAIEnhancementSettingsFromOnboarding,
-            onFinishSetup: self.finishOnboardingAtGettingStarted
+            onUseAIProvider: {
+                let origin = self.settings.analyticsOnboardingOrigin
+                self.openAIEnhancementSettingsFromOnboarding()
+                self.completeCurrentStep(
+                    outcome: .openedSettings,
+                    origin: origin,
+                    completesFlow: self.settings.onboardingCompleted
+                )
+            },
+            onFinishSetup: {
+                let origin = self.settings.analyticsOnboardingOrigin
+                self.finishOnboardingAtGettingStarted()
+                self.completeCurrentStep(
+                    outcome: .completed,
+                    origin: origin,
+                    completesFlow: self.settings.onboardingCompleted
+                )
+            }
         )
     }
 
@@ -1919,7 +1959,7 @@ struct OnboardingFlowView: View {
                         canSkip: !self.asr.isRunning && !self.isRecordingAnyShortcut,
                         skipAction: {
                             self.settings.onboardingPlaygroundSkipped = true
-                            self.goNext()
+                            self.goNext(outcome: .skipped)
                         }
                     )
                 }
@@ -2063,7 +2103,7 @@ struct OnboardingFlowView: View {
             }
 
             do {
-                try await self.asr.ensureAsrReady()
+                try await self.asr.ensureAsrReady(source: .onboarding)
             } catch is CancellationError {
                 DebugLogger.shared.info("Cancelled onboarding voice model setup for \(route.model.displayName)", source: "OnboardingFlowView")
             } catch {
@@ -2788,7 +2828,8 @@ struct OnboardingFlowView: View {
         self.currentStep = max(0, self.currentStep - 1)
     }
 
-    private func goNext() {
+    private func goNext(outcome: AnalyticsOnboardingOutcome = .continued) {
+        self.completeCurrentStep(outcome: outcome)
         self.activeShortcutRecordingTarget = nil
         self.shortcutRecordingMessage = nil
         self.currentStep = min(Step.allCases.count - 1, self.currentStep + 1)
@@ -2805,10 +2846,29 @@ struct OnboardingFlowView: View {
 
         if self.step == .aiEnhancement {
             guard self.isAIReady else { return }
+            let origin = self.settings.analyticsOnboardingOrigin
             self.finishOnboarding()
+            self.completeCurrentStep(
+                outcome: .completed,
+                origin: origin,
+                completesFlow: self.settings.onboardingCompleted
+            )
             return
         }
         self.goNext()
+    }
+
+    private func completeCurrentStep(
+        outcome: AnalyticsOnboardingOutcome,
+        origin: AnalyticsOnboardingOrigin? = nil,
+        completesFlow: Bool = false
+    ) {
+        AnalyticsService.shared.recordOnboardingStepCompleted(
+            self.step.analyticsStep,
+            outcome: outcome,
+            origin: origin ?? self.settings.analyticsOnboardingOrigin,
+            completesFlow: completesFlow
+        )
     }
 }
 
