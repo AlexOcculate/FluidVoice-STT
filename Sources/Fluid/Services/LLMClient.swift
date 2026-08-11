@@ -897,6 +897,13 @@ final class LLMClient {
         var workingText = text
         var thinking = ""
 
+        // Models that emit a proper <think>…</think> block may still leak a stray
+        // </think> later in their answer. Detect up front whether an opening tag was
+        // ever present so the orphan pass below is only applied to the no-opening-tag
+        // case it is meant for (e.g. Nemotron's "thoughts</think>response").
+        let hasOpeningThinkTag = text.range(of: "<think>") != nil
+            || text.range(of: "<thinking>") != nil
+
         // First, handle proper <think>...</think> pairs
         if let regex = try? NSRegularExpression(pattern: Self.thinkingTagPattern, options: []) {
             let range = NSRange(workingText.startIndex..., in: workingText)
@@ -912,8 +919,15 @@ final class LLMClient {
         }
 
         // Second, handle orphan closing tags (content before </think> without opening tag)
-        // This handles cases like "We have a request...</think>Hello!"
-        if let orphanRegex = try? NSRegularExpression(pattern: Self.orphanThinkingPattern, options: []) {
+        // This handles cases like "We have a request...</think>Hello!" (Nemotron-style output
+        // that begins with thinking and uses </think> as the separator, with no opening tag).
+        // Skip this when an opening tag was present: there the thinking section was already
+        // removed above, so any remaining </think> is stray markup and is stripped below
+        // rather than reclassifying the preceding answer text as thinking (which dropped the
+        // text between the real close and the stray close from the visible response).
+        if !hasOpeningThinkTag,
+           let orphanRegex = try? NSRegularExpression(pattern: Self.orphanThinkingPattern, options: [])
+        {
             let range = NSRange(workingText.startIndex..., in: workingText)
             let matches = orphanRegex.matches(in: workingText, options: [], range: range)
 
