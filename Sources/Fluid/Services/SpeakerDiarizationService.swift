@@ -99,10 +99,15 @@ actor SpeakerDiarizationService {
                gap <= maxGapSeconds,
                combinedDuration <= maxTurnSeconds
             {
+                // A merge must never shrink the covered time range. Diarization
+                // segments can overlap at boundaries (overlapping speech, VAD
+                // imprecision), so a later same-speaker turn may end before the
+                // accumulated turn — taking turn.endSeconds directly would drop the
+                // trailing audio ([turn.end, current.end]) from the slice.
                 current = SpeakerTurn(
                     speakerLabel: current.speakerLabel,
                     startSeconds: current.startSeconds,
-                    endSeconds: turn.endSeconds
+                    endSeconds: max(current.endSeconds, turn.endSeconds)
                 )
             } else {
                 merged.append(current)
