@@ -3143,6 +3143,18 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Whether transient microphone selection and availability alerts are shown.
+    var showMicrophoneChangeAlerts: Bool {
+        get {
+            let value = self.defaults.object(forKey: Keys.showMicrophoneChangeAlerts)
+            return value as? Bool ?? true
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.showMicrophoneChangeAlerts)
+        }
+    }
+
     func makeBackupPayload() -> SettingsBackupPayload {
         SettingsBackupPayload(
             selectedProviderID: self.selectedProviderID,
@@ -3212,6 +3224,7 @@ final class SettingsStore: ObservableObject {
             saveAudioWithTranscriptionHistory: self.saveAudioWithTranscriptionHistory,
             audioHistoryBudgetGB: self.audioHistoryBudgetGB,
             notifyAIProcessingFailures: self.notifyAIProcessingFailures,
+            showMicrophoneChangeAlerts: self.showMicrophoneChangeAlerts,
             weekendsDontBreakStreak: self.weekendsDontBreakStreak,
             fillerWords: self.fillerWords,
             removeFillerWordsEnabled: self.removeFillerWordsEnabled,
@@ -3350,6 +3363,9 @@ final class SettingsStore: ObservableObject {
         }
         if let notifyAIProcessingFailures = payload.notifyAIProcessingFailures {
             self.notifyAIProcessingFailures = notifyAIProcessingFailures
+        }
+        if let showMicrophoneChangeAlerts = payload.showMicrophoneChangeAlerts {
+            self.showMicrophoneChangeAlerts = showMicrophoneChangeAlerts
         }
         self.weekendsDontBreakStreak = payload.weekendsDontBreakStreak
         self.fillerWords = payload.fillerWords
@@ -5078,6 +5094,7 @@ private extension SettingsStore {
         static let microphoneSelectionMode = "MicrophoneSelectionMode"
         // Keep the original persisted key so existing installs migrate in place.
         static let microphoneSelectionMigrationVersion = "AppOnlyMicrophoneSelectionMigrationVersion"
+        static let showMicrophoneChangeAlerts = "ShowMicrophoneChangeAlerts"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
         static let launchAtStartup = "LaunchAtStartup"
         static let showInDock = "ShowInDock"

@@ -908,16 +908,6 @@ struct SettingsView: View {
                                     }
 
                                     self.optionToggleRow(
-                                        title: "Notify AI Enhancement Failures",
-                                        description: "Show a macOS notification when AI Enhancement fails and raw transcription is typed.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.notifyAIProcessingFailures },
-                                            set: { SettingsStore.shared.notifyAIProcessingFailures = $0 }
-                                        )
-                                    )
-                                    Divider().opacity(0.2)
-
-                                    self.optionToggleRow(
                                         title: "Weekends Don't Break Streak",
                                         description: "Skip Saturday and Sunday when calculating usage streaks. Perfect for weekday-only users.",
                                         isOn: Binding(
@@ -1073,6 +1063,43 @@ struct SettingsView: View {
                                     .controlSize(.small)
                                 }
                             }
+                        }
+                    }
+                    .padding(16)
+                }
+
+                // Notification Settings Card
+                ThemedCard(style: .standard) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Label("Notifications", systemImage: "bell.fill")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            self.optionToggleRow(
+                                title: "AI Enhancement Failures",
+                                description: "Notify when AI Enhancement fails and raw transcription is typed.",
+                                isOn: Binding(
+                                    get: { SettingsStore.shared.notifyAIProcessingFailures },
+                                    set: { SettingsStore.shared.notifyAIProcessingFailures = $0 }
+                                )
+                            )
+
+                            Divider().opacity(0.2)
+
+                            self.optionToggleRow(
+                                title: "Microphone Changes",
+                                description: "Show an alert when FluidVoice changes or loses its microphone.",
+                                isOn: Binding(
+                                    get: { self.settings.showMicrophoneChangeAlerts },
+                                    set: { enabled in
+                                        self.settings.showMicrophoneChangeAlerts = enabled
+                                        if enabled == false {
+                                            MicrophoneChangeOverlayController.shared.hide()
+                                        }
+                                    }
+                                )
+                            )
                         }
                     }
                     .padding(16)

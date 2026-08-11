@@ -15,6 +15,7 @@ final class HotkeyShortcutTests: XCTestCase {
     private let microphonePriorityKey = "MicrophonePriority"
     private let suppressedMicrophoneUIDsKey = "SuppressedMicrophoneUIDs"
     private let microphoneSelectionMigrationVersionKey = "AppOnlyMicrophoneSelectionMigrationVersion"
+    private let showMicrophoneChangeAlertsKey = "ShowMicrophoneChangeAlerts"
     private let experimentalDirectAudioCaptureEnabledKey = "ExperimentalDirectAudioCaptureEnabled"
 
     @MainActor
@@ -1139,6 +1140,29 @@ final class HotkeyShortcutTests: XCTestCase {
 
             coordinator.confirmActiveSelection(uid: preferred.uid, name: preferred.name)
             XCTAssertEqual(coordinator.confirmedActiveInputUID, preferred.uid)
+        }
+    }
+
+    @MainActor
+    func testDisablingMicrophoneChangeAlertsPreservesMicrophonePriority() throws {
+        try self.withRestoredDefaults(keys: [
+            self.microphonePriorityKey,
+            self.showMicrophoneChangeAlertsKey,
+        ]) {
+            let defaults = UserDefaults.standard
+            defaults.removeObject(forKey: self.showMicrophoneChangeAlertsKey)
+            let microphone = Self.device(uid: "preferred", name: "Preferred")
+            SettingsStore.shared.microphonePriority = [
+                .init(uid: microphone.uid, name: microphone.name),
+            ]
+
+            XCTAssertTrue(SettingsStore.shared.showMicrophoneChangeAlerts)
+
+            MicrophoneChangeOverlayController.shared.disableFutureAlerts()
+
+            XCTAssertFalse(SettingsStore.shared.showMicrophoneChangeAlerts)
+            XCTAssertEqual(SettingsStore.shared.makeBackupPayload().showMicrophoneChangeAlerts, false)
+            XCTAssertEqual(SettingsStore.shared.microphonePriority.map(\.uid), [microphone.uid])
         }
     }
 

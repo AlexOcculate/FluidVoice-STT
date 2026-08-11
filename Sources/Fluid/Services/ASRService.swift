@@ -1388,11 +1388,6 @@ final class ASRService: ObservableObject {
             availableInputs: initialInputSnapshot.0,
             defaultInputUID: initialInputSnapshot.1
         )
-        microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
-            microphoneAuthorized: self.micStatus == .authorized,
-            launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
-                .shouldPresentStartupMicrophoneNotice ?? true
-        )
 
         self.registerDefaultDeviceChangeListener()
         self.registerEngineConfigurationChangeObserver()
@@ -1495,11 +1490,6 @@ final class ASRService: ObservableObject {
                     self.micPermissionGranted = granted
                     self.micStatus = granted ? .authorized : .denied
                     if granted {
-                        AppServices.shared.microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
-                            microphoneAuthorized: true,
-                            launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
-                                .shouldPresentStartupMicrophoneNotice ?? true
-                        )
                         await self.prewarmConfiguredAudioCaptureIfPossible(reason: "permission_granted")
                     }
                 }
