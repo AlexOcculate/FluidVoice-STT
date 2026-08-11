@@ -180,6 +180,7 @@ private actor AnalyticsCore {
     private let consentGate: AnalyticsConsentGate
     private var database: AnalyticsDatabase?
     private var flushTask: Task<Void, Never>?
+    private var activeUploadTask: Task<Int, Error>?
     private var isFlushing = false
 
     private let batchSize = 50
@@ -209,6 +210,7 @@ private actor AnalyticsCore {
     func setEnabled(context: AnalyticsContext) async {
         guard self.apply(context) else { return }
         if !context.enabled {
+            self.activeUploadTask?.cancel()
             self.stopFlushLoop()
             try? self.purgeStoredAnalyticsIfPresent(context: context)
             return
@@ -407,7 +409,10 @@ private actor AnalyticsCore {
         else { return }
 
         self.isFlushing = true
-        defer { self.isFlushing = false }
+        defer {
+            self.activeUploadTask = nil
+            self.isFlushing = false
+        }
 
         let items: [AnalyticsOutboxItem]
         do {
@@ -420,13 +425,23 @@ private actor AnalyticsCore {
         guard self.consentGate.accepts(context.consentGeneration) else { return }
 
         let ids = items.map(\.id)
+        let uploadTask = Task {
+            guard self.consentGate.accepts(context.consentGeneration) else {
+                throw CancellationError()
+            }
+            return try await self.send(items: items, config: context.config)
+        }
+        self.activeUploadTask = uploadTask
+
         let status: Int
         do {
-            status = try await self.send(items: items, config: context.config)
+            status = try await uploadTask.value
         } catch {
+            guard self.consentGate.accepts(context.consentGeneration) else { return }
             try? database.retry(ids: ids, at: Date())
             return
         }
+        guard self.consentGate.accepts(context.consentGeneration) else { return }
 
         switch status {
         case 200..<300:
