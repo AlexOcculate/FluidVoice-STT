@@ -78,6 +78,30 @@ final class SpeakerTurnMergingTests: XCTestCase {
         XCTAssertEqual(kept.count, 5, "correct labels keep the exchange separated")
     }
 
+    /// Regression: diarization segments can overlap at boundaries. A later
+    /// same-speaker turn that ends inside the accumulated turn used to overwrite
+    /// `endSeconds` with its own (earlier) end, dropping the trailing audio.
+    func testOverlappingSameSpeakerTurnDoesNotShrinkMergedRange() {
+        let merged = SpeakerDiarizationService.mergeAdjacentTurns([
+            self.turn("Speaker 1", 0, 10),
+            self.turn("Speaker 1", 5, 8),
+        ])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].startSeconds, 0)
+        XCTAssertEqual(merged[0].endSeconds, 10, "a contained turn must not shrink the merged range")
+    }
+
+    /// A turn ending exactly at the accumulated end is the normal adjacent case
+    /// and must still extend (or hold) the range to that boundary.
+    func testTouchingSameSpeakerTurnExtendsToEnd() {
+        let merged = SpeakerDiarizationService.mergeAdjacentTurns([
+            self.turn("Speaker 1", 0, 10),
+            self.turn("Speaker 1", 9.5, 12),
+        ])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].endSeconds, 12)
+    }
+
     func testOverlongRunIsCappedNotMergedIndefinitely() {
         var turns: [Turn] = []
         var t = 0.0
