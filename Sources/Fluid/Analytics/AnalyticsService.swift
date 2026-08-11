@@ -4,9 +4,14 @@ import Foundation
 final class AnalyticsService {
     static let shared = AnalyticsService()
 
-    private let core = AnalyticsCore()
+    private let consentGate: AnalyticsConsentGate
+    private let core: AnalyticsCore
 
-    private init() {}
+    private init() {
+        let consentGate = AnalyticsConsentGate()
+        self.consentGate = consentGate
+        self.core = AnalyticsCore(consentGate: consentGate)
+    }
 
     func bootstrap() {
         self.submit { core, context in
@@ -15,9 +20,10 @@ final class AnalyticsService {
     }
 
     func setEnabled(_ enabled: Bool) {
-        let context = Self.context(enabled: enabled)
+        let consentGeneration = self.consentGate.advance()
+        let context = Self.context(enabled: enabled, consentGeneration: consentGeneration)
         Task.detached(priority: .background) { [core] in
-            await core.setEnabled(enabled, context: context)
+            await core.setEnabled(context: context)
         }
     }
 
@@ -120,16 +126,20 @@ final class AnalyticsService {
     private func submit(
         _ operation: @escaping @Sendable (AnalyticsCore, AnalyticsContext) async -> Void
     ) {
-        let context = Self.context(enabled: SettingsStore.shared.shareAnonymousAnalytics)
+        let context = Self.context(
+            enabled: SettingsStore.shared.shareAnonymousAnalytics,
+            consentGeneration: self.consentGate.currentGeneration
+        )
         Task.detached(priority: .background) { [core] in
             await operation(core, context)
         }
     }
 
-    private static func context(enabled: Bool) -> AnalyticsContext {
+    private static func context(enabled: Bool, consentGeneration: UInt64) -> AnalyticsContext {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
         return AnalyticsContext(
             enabled: enabled,
+            consentGeneration: consentGeneration,
             config: AnalyticsConfig.fromBundle(),
             distinctID: AnalyticsIdentityStore.shared.anonymousInstallID,
             appVersion: version
@@ -139,21 +149,47 @@ final class AnalyticsService {
 
 private struct AnalyticsContext {
     let enabled: Bool
+    let consentGeneration: UInt64
     let config: AnalyticsConfig
     let distinctID: String
     let appVersion: String
 }
 
+final nonisolated class AnalyticsConsentGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    var currentGeneration: UInt64 {
+        self.lock.withLock { self.generation }
+    }
+
+    func advance() -> UInt64 {
+        self.lock.withLock {
+            self.generation &+= 1
+            return self.generation
+        }
+    }
+
+    func accepts(_ generation: UInt64) -> Bool {
+        self.lock.withLock { generation == self.generation }
+    }
+}
+
 private actor AnalyticsCore {
     private var context: AnalyticsContext?
+    private let consentGate: AnalyticsConsentGate
     private var database: AnalyticsDatabase?
     private var flushTask: Task<Void, Never>?
     private var isFlushing = false
 
     private let batchSize = 50
 
+    init(consentGate: AnalyticsConsentGate) {
+        self.consentGate = consentGate
+    }
+
     func bootstrap(context: AnalyticsContext) async {
-        self.context = context
+        guard self.apply(context) else { return }
         guard context.enabled else {
             try? self.purgeStoredAnalyticsIfPresent(context: context)
             return
@@ -170,9 +206,9 @@ private actor AnalyticsCore {
         }
     }
 
-    func setEnabled(_ enabled: Bool, context: AnalyticsContext) async {
-        self.context = context
-        if !enabled {
+    func setEnabled(context: AnalyticsContext) async {
+        guard self.apply(context) else { return }
+        if !context.enabled {
             self.stopFlushLoop()
             try? self.purgeStoredAnalyticsIfPresent(context: context)
             return
@@ -282,7 +318,7 @@ private actor AnalyticsCore {
         context: AnalyticsContext,
         operation: (AnalyticsDatabase, Date) throws -> Void
     ) async {
-        self.context = context
+        guard self.apply(context) else { return }
         guard context.enabled, context.config.isConfigured else { return }
         do {
             let database = try self.database(for: context)
@@ -291,6 +327,12 @@ private actor AnalyticsCore {
         } catch {
             return
         }
+    }
+
+    private func apply(_ context: AnalyticsContext) -> Bool {
+        guard self.consentGate.accepts(context.consentGeneration) else { return false }
+        self.context = context
+        return true
     }
 
     private func database(for context: AnalyticsContext) throws -> AnalyticsDatabase {
@@ -335,7 +377,12 @@ private actor AnalyticsCore {
     }
 
     private func startFlushLoopIfNeeded() {
-        guard self.flushTask == nil, let context, context.enabled, context.config.isConfigured else { return }
+        guard self.flushTask == nil,
+              let context,
+              self.consentGate.accepts(context.consentGeneration),
+              context.enabled,
+              context.config.isConfigured
+        else { return }
         self.flushTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
@@ -353,6 +400,7 @@ private actor AnalyticsCore {
     private func flushIfNeeded() async {
         guard !self.isFlushing,
               let context,
+              self.consentGate.accepts(context.consentGeneration),
               context.enabled,
               context.config.isConfigured,
               let database
@@ -369,6 +417,7 @@ private actor AnalyticsCore {
             return
         }
         guard !items.isEmpty else { return }
+        guard self.consentGate.accepts(context.consentGeneration) else { return }
 
         let ids = items.map(\.id)
         let status: Int

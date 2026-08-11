@@ -2687,38 +2687,6 @@ struct OnboardingFlowView: View {
         )
     }
 
-    private var orderedOnboardingInputDevices: [AudioDevice.Device] {
-        let devicesByUID = Dictionary(
-            self.onboardingInputDevices.map { ($0.uid, $0) },
-            uniquingKeysWith: { current, _ in current }
-        )
-        var ordered = self.settings.microphonePriority.compactMap { devicesByUID[$0.uid] }
-        let knownUIDs = Set(ordered.map(\.uid))
-        ordered.append(contentsOf: self.onboardingInputDevices.filter { !knownUIDs.contains($0.uid) })
-        return ordered
-    }
-
-    private func isOnboardingRouteSelected(_ route: VoiceEngineLanguageRoute) -> Bool {
-        self.selectedOnboardingRoute?.id == route.id || self.isRouteSelectedInSettings(route)
-    }
-
-    private func isRouteSelectedInSettings(_ route: VoiceEngineLanguageRoute) -> Bool {
-        guard route.model == self.settings.selectedSpeechModel else {
-            return false
-        }
-
-        switch route.binding {
-        case .automatic, .whisper:
-            return self.settings.onboardingSelectedLanguageID == route.language.id
-        case let .appleSpeech(localeIdentifier):
-            return self.settings.selectedAppleSpeechLocaleIdentifier == localeIdentifier
-        case let .cohere(language):
-            return self.settings.selectedCohereLanguage == language
-        case let .nemotron(language):
-            return self.settings.selectedNemotronLanguage == language
-        }
-    }
-
     private func isRouteModelAndLanguageSettingsSelected(_ route: VoiceEngineLanguageRoute) -> Bool {
         guard route.model == self.settings.selectedSpeechModel else {
             return false
@@ -2873,6 +2841,38 @@ struct OnboardingFlowView: View {
 }
 
 private extension OnboardingFlowView {
+    var orderedOnboardingInputDevices: [AudioDevice.Device] {
+        let devicesByUID = Dictionary(
+            self.onboardingInputDevices.map { ($0.uid, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        var ordered = self.settings.microphonePriority.compactMap { devicesByUID[$0.uid] }
+        let knownUIDs = Set(ordered.map(\.uid))
+        ordered.append(contentsOf: self.onboardingInputDevices.filter { !knownUIDs.contains($0.uid) })
+        return ordered
+    }
+
+    func isOnboardingRouteSelected(_ route: VoiceEngineLanguageRoute) -> Bool {
+        self.selectedOnboardingRoute?.id == route.id || self.isRouteSelectedInSettings(route)
+    }
+
+    func isRouteSelectedInSettings(_ route: VoiceEngineLanguageRoute) -> Bool {
+        guard route.model == self.settings.selectedSpeechModel else {
+            return false
+        }
+
+        switch route.binding {
+        case .automatic, .whisper:
+            return self.settings.onboardingSelectedLanguageID == route.language.id
+        case let .appleSpeech(localeIdentifier):
+            return self.settings.selectedAppleSpeechLocaleIdentifier == localeIdentifier
+        case let .cohere(language):
+            return self.settings.selectedCohereLanguage == language
+        case let .nemotron(language):
+            return self.settings.selectedNemotronLanguage == language
+        }
+    }
+
     func refreshOnboardingMicrophoneAuthorization(checkModels: Bool = false) {
         Task { @MainActor in
             await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()

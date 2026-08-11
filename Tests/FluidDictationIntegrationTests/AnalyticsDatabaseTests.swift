@@ -109,6 +109,15 @@ final class AnalyticsDatabaseTests: XCTestCase {
         XCTAssertEqual(finish.properties["duration_seconds"] as? Double, 25)
     }
 
+    func testConsentGateRejectsWorkQueuedBeforeOptOut() {
+        let gate = AnalyticsConsentGate()
+        let queuedGeneration = gate.currentGeneration
+        let currentGeneration = gate.advance()
+
+        XCTAssertFalse(gate.accepts(queuedGeneration))
+        XCTAssertTrue(gate.accepts(currentGeneration))
+    }
+
     private func makeDatabase(url: URL? = nil) throws -> AnalyticsDatabase {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
