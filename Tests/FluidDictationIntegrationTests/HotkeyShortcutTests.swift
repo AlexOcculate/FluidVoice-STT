@@ -1329,6 +1329,37 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testClamshellKeepsBuiltInTransportExternalMicrophoneAvailable() throws {
+        try self.withRestoredDefaults(keys: [
+            self.microphoneSelectionModeKey,
+            self.preferredInputDeviceUIDKey,
+            self.microphonePriorityKey,
+            self.microphoneSelectionMigrationVersionKey,
+        ]) {
+            let wiredHeadset = Self.device(
+                uid: "wired-headset",
+                name: "External Microphone",
+                transportType: kAudioDeviceTransportTypeBuiltIn,
+                inputDataSourceID: AudioDevice.Device.externalMicrophoneDataSourceID
+            )
+            SettingsStore.shared.microphonePriority = [
+                .init(uid: wiredHeadset.uid, name: wiredHeadset.name),
+            ]
+            SettingsStore.shared.microphoneSelectionMode = .manual
+            SettingsStore.shared.microphoneSelectionMigrationVersion = 4
+            let devices = FakeAudioDeviceManager(
+                inputs: [wiredHeadset],
+                defaultInputUID: wiredHeadset.uid,
+                isClamshellClosed: true
+            )
+            let coordinator = MicrophonePreferenceCoordinator(settings: .shared, devices: devices)
+
+            XCTAssertTrue(wiredHeadset.isBuiltIn)
+            XCTAssertEqual(coordinator.inputDeviceForCapture(), wiredHeadset)
+        }
+    }
+
     func testNewMicrophoneEntersSecondAndStaysAfterDisconnecting() throws {
         try self.withRestoredDefaults(keys: [
             self.preferredInputDeviceUIDKey,
@@ -1420,7 +1451,8 @@ final class HotkeyShortcutTests: XCTestCase {
     private static func device(
         uid: String,
         name: String,
-        transportType: UInt32 = kAudioDeviceTransportTypeUnknown
+        transportType: UInt32 = kAudioDeviceTransportTypeUnknown,
+        inputDataSourceID: UInt32? = nil
     ) -> AudioDevice.Device {
         AudioDevice.Device(
             id: AudioObjectID(abs(uid.hashValue % 100_000) + 1),
@@ -1428,7 +1460,8 @@ final class HotkeyShortcutTests: XCTestCase {
             name: name,
             hasInput: true,
             hasOutput: false,
-            transportType: transportType
+            transportType: transportType,
+            inputDataSourceID: inputDataSourceID
         )
     }
 
