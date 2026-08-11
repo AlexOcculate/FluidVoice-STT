@@ -75,6 +75,11 @@ final class LLMClient {
         self.session = URLSession(configuration: config)
     }
 
+    /// Test seam for deterministic transport fixtures; callers own the session configuration.
+    init(session: URLSession) {
+        self.session = session
+    }
+
     // MARK: - Response Types
 
     struct Response {
@@ -678,52 +683,51 @@ final class LLMClient {
                     }
                     contentBuffer.append(content)
                     config.onContentChunk?(content)
-                    continue
-                }
+                } else {
+                    // If we were in thinking mode via a separate field (not tag-based),
+                    // receiving "content" usually means the thinking phase is over.
+                    if state == .inThinking && reasoningField == nil && tagDetectionBuffer.isEmpty {
+                        // This is a subtle heuristic: if we were thinking, didn't just get a reasoning field chunk,
+                        // and have no partial tags buffered, we should check if this content chunk
+                        // is the start of the final answer.
+                        // For safety with tag-based parsers, we let the parser decide unless it's a known separate-field model.
+                    }
 
-                // If we were in thinking mode via a separate field (not tag-based),
-                // receiving "content" usually means the thinking phase is over.
-                if state == .inThinking && reasoningField == nil && tagDetectionBuffer.isEmpty {
-                    // This is a subtle heuristic: if we were thinking, didn't just get a reasoning field chunk,
-                    // and have no partial tags buffered, we should check if this content chunk
-                    // is the start of the final answer.
-                    // For safety with tag-based parsers, we let the parser decide unless it's a known separate-field model.
-                }
+                    // Debug: Log first few chunks and any chunk containing think tags
+                    let containsThinkTag = content.contains("<think") || content.contains("</think") || content.contains("<thinking") || content.contains("</thinking")
+                    if thinkingBuffer.count + contentBuffer.count < 8 || containsThinkTag {
+                        let escaped = content.replacingOccurrences(of: "\n", with: "\\n")
+                        let marker = containsThinkTag ? " [HAS THINK TAG!]" : ""
+                        DebugLogger.shared.debug("LLMClient: Chunk '\(escaped)'\(marker)", source: "LLMClient")
+                    }
 
-                // Debug: Log first few chunks and any chunk containing think tags
-                let containsThinkTag = content.contains("<think") || content.contains("</think") || content.contains("<thinking") || content.contains("</thinking")
-                if thinkingBuffer.count + contentBuffer.count < 8 || containsThinkTag {
-                    let escaped = content.replacingOccurrences(of: "\n", with: "\\n")
-                    let marker = containsThinkTag ? " [HAS THINK TAG!]" : ""
-                    DebugLogger.shared.debug("LLMClient: Chunk '\(escaped)'\(marker)", source: "LLMClient")
-                }
+                    let previousState = state
+                    let (newState, thinkChunk, contentChunk) = parser.processChunk(
+                        content,
+                        currentState: state,
+                        tagBuffer: &tagDetectionBuffer
+                    )
 
-                let previousState = state
-                let (newState, thinkChunk, contentChunk) = parser.processChunk(
-                    content,
-                    currentState: state,
-                    tagBuffer: &tagDetectionBuffer
-                )
+                    // Handle state transitions for callbacks
+                    if previousState != .inThinking && newState == .inThinking {
+                        DebugLogger.shared.debug("LLMClient: State transition → inThinking", source: "LLMClient")
+                        config.onThinkingStart?()
+                    }
+                    if previousState == .inThinking && newState == .inContent {
+                        DebugLogger.shared.debug("LLMClient: State transition → inContent", source: "LLMClient")
+                        config.onThinkingEnd?()
+                    }
+                    state = newState
 
-                // Handle state transitions for callbacks
-                if previousState != .inThinking && newState == .inThinking {
-                    DebugLogger.shared.debug("LLMClient: State transition → inThinking", source: "LLMClient")
-                    config.onThinkingStart?()
-                }
-                if previousState == .inThinking && newState == .inContent {
-                    DebugLogger.shared.debug("LLMClient: State transition → inContent", source: "LLMClient")
-                    config.onThinkingEnd?()
-                }
-                state = newState
-
-                // Accumulate and callback
-                if !thinkChunk.isEmpty {
-                    thinkingBuffer.append(thinkChunk)
-                    config.onThinkingChunk?(thinkChunk)
-                }
-                if !contentChunk.isEmpty {
-                    contentBuffer.append(contentChunk)
-                    config.onContentChunk?(contentChunk)
+                    // Accumulate and callback
+                    if !thinkChunk.isEmpty {
+                        thinkingBuffer.append(thinkChunk)
+                        config.onThinkingChunk?(thinkChunk)
+                    }
+                    if !contentChunk.isEmpty {
+                        contentBuffer.append(contentChunk)
+                        config.onContentChunk?(contentChunk)
+                    }
                 }
             }
 
