@@ -90,6 +90,9 @@ struct SettingsBackupPayload: Codable, Equatable {
     let punctuationDictionaryPrefix: String?
     // swiftlint:disable:next discouraged_optional_collection
     let punctuationDictionaryRules: [SettingsStore.PunctuationDictionaryRule]?
+    // Optional so backups created before spoken formatting actions still decode.
+    // swiftlint:disable:next discouraged_optional_collection
+    let spokenFormattingActionRules: [SettingsStore.SpokenFormattingActionRule]?
     let gaavModeEnabled: Bool
     let gaavLowercaseFirstLetterEnabled: Bool?
     let gaavRemoveTrailingPeriodEnabled: Bool?

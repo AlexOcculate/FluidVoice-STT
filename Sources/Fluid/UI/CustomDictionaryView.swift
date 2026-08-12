@@ -10,6 +10,8 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+// This legacy screen still owns several dictionary editors; split them into standalone views incrementally.
+// swiftlint:disable:next type_body_length
 struct CustomDictionaryView: View {
     @Environment(\.theme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -56,6 +58,10 @@ struct CustomDictionaryView: View {
     @State private var punctuationAutoConvertEnabled = SettingsStore.shared.autoConvertPunctuationEnabled
     @State private var punctuationPrefix = SettingsStore.shared.punctuationDictionaryPrefix
     @State private var punctuationRules = SettingsStore.shared.punctuationDictionaryRules
+    @State private var formattingActionRules = SettingsStore.shared.spokenFormattingActionRules
+    @State private var editingFormattingAction: SettingsStore.SpokenFormattingAction?
+    @State private var formattingActionAliasesText = ""
+    @State private var isFormattingResetAlertPresented = false
     @State private var isPunctuationInfoExpanded = false
     @State private var isPunctuationRuleEditorPresented = false
     @State private var editingPunctuationRuleID: UUID?
@@ -304,6 +310,7 @@ struct CustomDictionaryView: View {
                 SettingsStore.shared.pronunciationMatchingEnabled = false
             }
             self.punctuationAutoConvertEnabled = SettingsStore.shared.autoConvertPunctuationEnabled
+            self.formattingActionRules = SettingsStore.shared.spokenFormattingActionRules
         }
         .onReceive(NotificationCenter.default.publisher(for: .parakeetVocabularyDidChange)) { _ in
             self.entries = SettingsStore.shared.customDictionaryEntries
@@ -900,15 +907,13 @@ struct CustomDictionaryView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        Text("Punctuation Dictionary")
+                        Text("Spoken Formatting")
                             .font(self.theme.typography.sectionTitle)
-                        if !self.punctuationRules.isEmpty {
-                            Text("(\(self.punctuationRules.count))")
-                                .font(self.theme.typography.captionSmall)
-                                .foregroundStyle(self.theme.palette.tertiaryText)
-                        }
+                        Text("\(SettingsStore.SpokenFormattingAction.allCases.count) actions · \(self.punctuationRules.count) punctuation")
+                            .font(self.theme.typography.captionSmall)
+                            .foregroundStyle(self.theme.palette.tertiaryText)
                     }
-                    Text("Say a start word first, then a punctuation name, to type punctuation symbols.")
+                    Text("Use a start word to safely insert formatting actions, punctuation, and symbols.")
                         .font(self.theme.typography.caption)
                         .foregroundStyle(self.theme.palette.secondaryText)
                 }
@@ -930,9 +935,7 @@ struct CustomDictionaryView: View {
             }
             .frame(width: Self.DictionaryHeaderControlLayout.actionButtonWidth)
             .fluidButton(.compact, size: .medium)
-            .disabled(!self.punctuationAutoConvertEnabled)
-            .opacity(self.punctuationAutoConvertEnabled ? 1 : 0.45)
-            .help(self.punctuationAutoConvertEnabled ? "Modify punctuation rules" : "Turn on Punctuation Dictionary to modify rules.")
+            .help("Modify spoken formatting")
             .popover(isPresented: self.$isPunctuationDictionaryPresented, arrowEdge: .top) {
                 self.punctuationDictionaryPopover
             }
@@ -943,14 +946,14 @@ struct CustomDictionaryView: View {
     }
 
     private var punctuationDictionaryToggle: some View {
-        Toggle("Punctuation Dictionary", isOn: self.$punctuationAutoConvertEnabled)
+        Toggle("Spoken Formatting", isOn: self.$punctuationAutoConvertEnabled)
             .labelsHidden()
             .toggleStyle(.switch)
             .onChange(of: self.punctuationAutoConvertEnabled) { _, newValue in
                 SettingsStore.shared.autoConvertPunctuationEnabled = newValue
             }
             .frame(width: Self.DictionaryHeaderControlLayout.toggleColumnWidth, alignment: .trailing)
-            .help("Turn Punctuation Dictionary on or off.")
+            .help("Turn Spoken Formatting on or off.")
     }
 
     private var entriesListView: some View {
@@ -1263,11 +1266,11 @@ struct CustomDictionaryView: View {
     }
 
     private var punctuationDictionaryPopover: some View {
-        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.lg) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: self.theme.metrics.spacing.md) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
-                        Text("Punctuation Dictionary")
+                        Text("Spoken Formatting")
                             .font(self.theme.typography.sectionTitle)
 
                         Button {
@@ -1280,11 +1283,11 @@ struct CustomDictionaryView: View {
                                 .frame(width: 28, height: 28)
                         }
                         .buttonStyle(SquareIconButtonStyle())
-                        .help("About punctuation rules")
-                        .accessibilityLabel("About punctuation rules")
+                        .help("About spoken formatting")
+                        .accessibilityLabel("About spoken formatting")
                     }
 
-                    Text("Say the start word first, then the punctuation name you want to type.")
+                    Text("Use one start word for formatting actions, punctuation, and symbols.")
                         .font(self.theme.typography.caption)
                         .foregroundStyle(self.theme.palette.secondaryText)
                 }
@@ -1301,101 +1304,278 @@ struct CustomDictionaryView: View {
                 .buttonStyle(SquareIconButtonStyle())
                 .help("Close")
             }
+            .padding(.horizontal, self.theme.metrics.spacing.lg)
+            .padding(.top, self.theme.metrics.spacing.lg)
+            .padding(.bottom, self.theme.metrics.spacing.md)
 
-            if self.isPunctuationInfoExpanded {
-                self.punctuationDictionaryInfoPanel
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: self.theme.metrics.spacing.lg) {
+                    self.spokenFormattingStatusRow
+
+                    if self.isPunctuationInfoExpanded {
+                        self.punctuationDictionaryInfoPanel
+                    }
+
+                    HStack(alignment: .top, spacing: self.theme.metrics.spacing.md) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Start Word")
+                                .font(self.theme.typography.captionStrong)
+                            Text("Say this first so normal words do not change.")
+                                .font(self.theme.typography.caption)
+                                .foregroundStyle(self.theme.palette.secondaryText)
+                            TextField("literal", text: self.$punctuationPrefix)
+                                .dictionaryInputChrome()
+                                .onSubmit { self.savePunctuationDictionaryPrefix() }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Try Saying")
+                                .font(self.theme.typography.captionStrong)
+                            Text("Examples of what FluidVoice will type.")
+                                .font(self.theme.typography.caption)
+                                .foregroundStyle(self.theme.palette.secondaryText)
+                            self.punctuationTrySayingPreview
+                        }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+
+                    self.formattingActionsSection
+                    self.punctuationRulesSection
+
+                    HStack {
+                        Spacer()
+                        Button("Reset All Defaults") {
+                            self.isFormattingResetAlertPresented = true
+                        }
+                        .fluidButton(.compact, size: .compact)
+                    }
+                }
+                .padding(.horizontal, self.theme.metrics.spacing.lg)
+                .padding(.bottom, self.theme.metrics.spacing.lg)
+            }
+            .frame(maxHeight: 650)
+        }
+        .frame(width: 680, alignment: .leading)
+        .onDisappear {
+            self.savePunctuationDictionaryPrefix()
+        }
+        .alert(
+            "Reset Spoken Formatting?",
+            isPresented: self.$isFormattingResetAlertPresented
+        ) {
+            Button("Reset All Defaults", role: .destructive) {
+                self.resetPunctuationDictionary()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This replaces the start word, formatting action phrases and enabled states, and every punctuation rule with their defaults.")
+        }
+    }
+
+    private var spokenFormattingStatusRow: some View {
+        HStack(spacing: self.theme.metrics.spacing.md) {
+            Image(systemName: self.punctuationAutoConvertEnabled ? "checkmark.circle.fill" : "pause.circle.fill")
+                .foregroundStyle(
+                    self.punctuationAutoConvertEnabled
+                        ? self.theme.palette.accent
+                        : self.theme.palette.secondaryText
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(self.punctuationAutoConvertEnabled ? "Spoken Formatting is On" : "Spoken Formatting is Off")
+                    .font(self.theme.typography.bodySmallStrong)
+                Text(
+                    self.punctuationAutoConvertEnabled
+                        ? "Formatting actions and punctuation will run after the start word."
+                        : "Your rules stay saved, but they will not change dictated text."
+                )
+                .font(self.theme.typography.caption)
+                .foregroundStyle(self.theme.palette.secondaryText)
             }
 
-            HStack(alignment: .top, spacing: self.theme.metrics.spacing.md) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Start Word")
-                        .font(self.theme.typography.captionStrong)
-                    Text("Say this first so normal words do not change.")
-                        .font(self.theme.typography.caption)
-                        .foregroundStyle(self.theme.palette.secondaryText)
-                    TextField("literal", text: self.$punctuationPrefix)
-                        .dictionaryInputChrome()
-                        .onSubmit { self.savePunctuationDictionaryPrefix() }
-                }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
+            Spacer()
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Try Saying")
-                        .font(self.theme.typography.captionStrong)
-                    Text("Examples of what FluidVoice will type.")
-                        .font(self.theme.typography.caption)
-                        .foregroundStyle(self.theme.palette.secondaryText)
-                    self.punctuationTrySayingPreview
+            Toggle("Spoken Formatting", isOn: self.$punctuationAutoConvertEnabled)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(self.theme.palette.accent)
+                .accessibilityLabel("Spoken Formatting")
+                .onChange(of: self.punctuationAutoConvertEnabled) { _, newValue in
+                    SettingsStore.shared.autoConvertPunctuationEnabled = newValue
                 }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .padding(self.theme.metrics.spacing.md)
+        .background(
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
+                .fill(self.theme.palette.contentBackground.opacity(0.5))
+                .overlay(
+                    RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
+                        .stroke(self.theme.palette.cardBorder.opacity(0.25), lineWidth: 1)
+                )
+        )
+    }
+
+    private var formattingActionsSection: some View {
+        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Formatting Actions")
+                    .font(self.theme.typography.bodySmallStrong)
+                Text("Fixed invisible actions with spoken phrases you can personalize.")
+                    .font(self.theme.typography.caption)
+                    .foregroundStyle(self.theme.palette.secondaryText)
             }
 
-            if self.isPunctuationRuleEditorPresented {
-                self.punctuationRuleEditor
-            } else {
-                HStack {
+            VStack(spacing: self.theme.metrics.spacing.sm) {
+                ForEach(SettingsStore.SpokenFormattingAction.allCases) { action in
+                    self.formattingActionRow(action)
+                }
+            }
+
+            if let action = self.editingFormattingAction {
+                self.formattingActionEditor(action)
+            }
+        }
+    }
+
+    private var punctuationRulesSection: some View {
+        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Punctuation")
+                        .font(self.theme.typography.bodySmallStrong)
+                    Text("Spoken names that type punctuation or symbols after the start word.")
+                        .font(self.theme.typography.caption)
+                        .foregroundStyle(self.theme.palette.secondaryText)
+                }
+
+                Spacer()
+
+                if !self.isPunctuationRuleEditorPresented {
                     Button {
                         self.startAddingPunctuationRule()
                     } label: {
                         Label("Add Rule", systemImage: "plus")
                     }
                     .fluidButton(.accent, size: .small)
-
-                    Spacer()
                 }
             }
 
-            VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Saved Rules")
-                        .font(self.theme.typography.captionStrong)
-                    Text("After the start word, these spoken versions type the punctuation symbol.")
-                        .font(self.theme.typography.caption)
-                        .foregroundStyle(self.theme.palette.secondaryText)
-                }
+            if self.isPunctuationRuleEditorPresented {
+                self.punctuationRuleEditor
+            }
 
-                if self.punctuationRules.isEmpty {
-                    self.dictionaryEmptyState(
-                        title: "No punctuation rules",
-                        detail: "Add what you say and what FluidVoice should type."
-                    )
-                } else {
-                    ScrollView(.vertical, showsIndicators: true) {
-                        VStack(spacing: self.theme.metrics.spacing.sm) {
-                            ForEach(self.punctuationRules) { rule in
-                                PunctuationDictionaryRuleRow(
-                                    rule: rule,
-                                    onEdit: { self.editPunctuationRule(rule) },
-                                    onDelete: { self.deletePunctuationRule(rule) }
-                                )
-                            }
-                        }
+            if self.punctuationRules.isEmpty {
+                self.dictionaryEmptyState(
+                    title: "No punctuation rules",
+                    detail: "Add what you say and what FluidVoice should type."
+                )
+            } else {
+                LazyVStack(spacing: self.theme.metrics.spacing.sm) {
+                    ForEach(self.punctuationRules) { rule in
+                        PunctuationDictionaryRuleRow(
+                            rule: rule,
+                            onEdit: { self.editPunctuationRule(rule) },
+                            onDelete: { self.deletePunctuationRule(rule) }
+                        )
                     }
-                    .frame(maxHeight: 235)
                 }
             }
+        }
+    }
+
+    private func formattingActionRow(_ action: SettingsStore.SpokenFormattingAction) -> some View {
+        let rule = self.formattingActionRule(for: action)
+        return HStack(spacing: self.theme.metrics.spacing.md) {
+            Text(action.displaySymbol)
+                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                .foregroundStyle(self.theme.palette.accent)
+                .frame(width: 32, height: 32)
+                .background(
+                    RoundedRectangle(cornerRadius: self.theme.metrics.corners.sm, style: .continuous)
+                        .fill(self.theme.palette.contentBackground.opacity(0.7))
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(action.title)
+                    .font(self.theme.typography.bodySmallStrong)
+                Text(rule.aliases.isEmpty ? "No spoken phrases set" : rule.aliases.joined(separator: ", "))
+                    .font(self.theme.typography.caption)
+                    .foregroundStyle(self.theme.palette.secondaryText)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: self.theme.metrics.spacing.md)
+
+            Button("Edit") {
+                self.startEditingFormattingAction(action)
+            }
+            .fluidButton(.compact, size: .compact)
+
+            Toggle(action.title, isOn: self.formattingActionEnabledBinding(for: action))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(self.theme.palette.accent)
+                .disabled(rule.aliases.isEmpty)
+                .help(rule.aliases.isEmpty ? "Add a spoken phrase before enabling this action." : "Enable \(action.title)")
+        }
+        .padding(.horizontal, self.theme.metrics.spacing.md)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
+                .fill(self.theme.palette.contentBackground.opacity(0.5))
+                .overlay(
+                    RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
+                        .stroke(self.theme.palette.cardBorder.opacity(0.25), lineWidth: 1)
+                )
+        )
+    }
+
+    private func formattingActionEditor(_ action: SettingsStore.SpokenFormattingAction) -> some View {
+        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
+            Text("Edit \(action.title) Phrases")
+                .font(self.theme.typography.captionStrong)
+            Text("Enter one phrase per line. Clearing every phrase disables this action.")
+                .font(self.theme.typography.caption)
+                .foregroundStyle(self.theme.palette.secondaryText)
+
+            TextEditor(text: self.$formattingActionAliasesText)
+                .font(self.theme.typography.bodySmall)
+                .frame(minHeight: 68, maxHeight: 92)
+                .scrollContentBackground(.hidden)
+                .dictionaryInputChrome(minHeight: 68)
+                .accessibilityLabel("Spoken phrases for \(action.title)")
 
             HStack {
                 Spacer()
-                Button("Reset Defaults") {
-                    self.resetPunctuationDictionary()
+                Button("Cancel") {
+                    self.dismissFormattingActionEditor()
                 }
                 .fluidButton(.compact, size: .compact)
+
+                Button("Save Phrases") {
+                    self.saveFormattingActionAliases(action)
+                }
+                .fluidButton(.accent, size: .small)
             }
         }
-        .padding(self.theme.metrics.spacing.lg)
-        .frame(width: 640, alignment: .leading)
-        .onDisappear {
-            self.savePunctuationDictionaryPrefix()
-        }
+        .padding(self.theme.metrics.spacing.md)
+        .background(
+            RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
+                .fill(self.theme.palette.contentBackground.opacity(0.5))
+                .overlay(
+                    RoundedRectangle(cornerRadius: self.theme.metrics.corners.md, style: .continuous)
+                        .stroke(self.theme.palette.accent.opacity(0.35), lineWidth: 1)
+                )
+        )
     }
 
     private var punctuationDictionaryInfoPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Say the start word first, then say the punctuation name.")
+            Text("Say the start word first, then a formatting action or punctuation name.")
+            Text("When you say \"\(self.punctuationPreviewPrefix) next line\", it starts a new line.")
             Text("When you say \"\(self.punctuationPreviewPrefix) comma\", it types \",\".")
-            Text("When you say \"\(self.punctuationPreviewPrefix) question mark\", it types \"?\".")
-            Text("For each rule, add one spoken version per line. Then choose what FluidVoice types.")
+            Text("Add one spoken phrase per line. Formatting actions always keep their fixed output.")
         }
         .font(self.theme.typography.caption)
         .foregroundStyle(self.theme.palette.secondaryText)
@@ -1419,8 +1599,8 @@ struct CustomDictionaryView: View {
                 typed: ","
             )
             self.punctuationExampleText(
-                spoken: "\(self.punctuationPreviewPrefix) question mark",
-                typed: "?"
+                spoken: "\(self.punctuationPreviewPrefix) next line",
+                typed: "New Line"
             )
         }
         .font(self.theme.typography.caption)
@@ -1626,7 +1806,9 @@ struct CustomDictionaryView: View {
     private func presentPunctuationDictionary() {
         self.punctuationPrefix = SettingsStore.shared.punctuationDictionaryPrefix
         self.punctuationRules = SettingsStore.shared.punctuationDictionaryRules
+        self.formattingActionRules = SettingsStore.shared.spokenFormattingActionRules
         self.isPunctuationInfoExpanded = false
+        self.dismissFormattingActionEditor()
         self.dismissPunctuationRuleEditor()
         self.isPunctuationDictionaryPresented = true
     }
@@ -1645,6 +1827,55 @@ struct CustomDictionaryView: View {
     private func savePunctuationRules() {
         SettingsStore.shared.punctuationDictionaryRules = self.punctuationRules
         self.punctuationRules = SettingsStore.shared.punctuationDictionaryRules
+    }
+
+    private func formattingActionRule(
+        for action: SettingsStore.SpokenFormattingAction
+    ) -> SettingsStore.SpokenFormattingActionRule {
+        self.formattingActionRules.first { $0.action == action }
+            ?? SettingsStore.SpokenFormattingActionRule(action: action, aliases: [], isEnabled: false)
+    }
+
+    private func formattingActionEnabledBinding(
+        for action: SettingsStore.SpokenFormattingAction
+    ) -> Binding<Bool> {
+        Binding(
+            get: { self.formattingActionRule(for: action).isEnabled },
+            set: { isEnabled in
+                guard let index = self.formattingActionRules.firstIndex(where: { $0.action == action }) else { return }
+                self.formattingActionRules[index].isEnabled = isEnabled
+                self.saveFormattingActionRules()
+            }
+        )
+    }
+
+    private func startEditingFormattingAction(_ action: SettingsStore.SpokenFormattingAction) {
+        self.editingFormattingAction = action
+        self.formattingActionAliasesText = self.formattingActionRule(for: action).aliases.joined(separator: "\n")
+    }
+
+    private func dismissFormattingActionEditor() {
+        self.editingFormattingAction = nil
+        self.formattingActionAliasesText = ""
+    }
+
+    private func saveFormattingActionAliases(_ action: SettingsStore.SpokenFormattingAction) {
+        let aliases = SettingsStore.PunctuationDictionaryRule.normalizedAliases(
+            self.formattingActionAliasesText.components(separatedBy: .newlines)
+        )
+        guard let index = self.formattingActionRules.firstIndex(where: { $0.action == action }) else { return }
+        self.formattingActionRules[index] = SettingsStore.SpokenFormattingActionRule(
+            action: action,
+            aliases: aliases,
+            isEnabled: aliases.isEmpty ? false : self.formattingActionRules[index].isEnabled
+        )
+        self.saveFormattingActionRules()
+        self.dismissFormattingActionEditor()
+    }
+
+    private func saveFormattingActionRules() {
+        SettingsStore.shared.spokenFormattingActionRules = self.formattingActionRules
+        self.formattingActionRules = SettingsStore.shared.spokenFormattingActionRules
     }
 
     private func startAddingPunctuationRule() {
@@ -1692,9 +1923,12 @@ struct CustomDictionaryView: View {
     private func resetPunctuationDictionary() {
         self.punctuationPrefix = SettingsStore.defaultPunctuationDictionaryPrefix
         self.punctuationRules = SettingsStore.defaultPunctuationDictionaryRules
+        self.formattingActionRules = SettingsStore.defaultSpokenFormattingActionRules
+        self.dismissFormattingActionEditor()
         self.dismissPunctuationRuleEditor()
         self.savePunctuationDictionaryPrefix()
         self.savePunctuationRules()
+        self.saveFormattingActionRules()
     }
 
     private func clearPunctuationRuleFields() {
@@ -2675,8 +2909,7 @@ enum CustomDictionaryManualEntry {
     /// A replacement that is entirely whitespace (e.g. a pasted newline or space)
     /// is a deliberate payload — keep it verbatim instead of trimming it to empty.
     static func sanitizedReplacement(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? text : trimmed
+        SettingsStore.CustomDictionaryEntry.sanitizedReplacement(text)
     }
 
     /// Whitespace-only replacements render as invisible/blank text, so show

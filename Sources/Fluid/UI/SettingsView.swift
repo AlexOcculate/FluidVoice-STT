@@ -918,58 +918,6 @@ struct SettingsView: View {
                                     Divider().opacity(0.2)
 
                                     self.optionToggleRow(
-                                        title: "Lowercase First Letter",
-                                        description: "Start each transcription with a lowercase letter. Useful for search queries, form fields, or casual text.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.gaavLowercaseFirstLetterEnabled },
-                                            set: { SettingsStore.shared.gaavLowercaseFirstLetterEnabled = $0 }
-                                        )
-                                    )
-                                    Divider().opacity(0.2)
-
-                                    self.optionToggleRow(
-                                        title: "Remove Trailing Period",
-                                        description: "Drop a final period from transcriptions. Feature requested by MaxGaav.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.gaavRemoveTrailingPeriodEnabled },
-                                            set: { SettingsStore.shared.gaavRemoveTrailingPeriodEnabled = $0 }
-                                        )
-                                    )
-                                    Divider().opacity(0.2)
-
-                                    self.optionToggleRow(
-                                        title: "Slash Commands & @ Formatting",
-                                        description: "When on, \"slash status\" becomes \"/status\"; \"tag Paul\", \"mention Paul\", \"at sign Paul\", and \"at the rate Paul\" become \"@Paul\". " +
-                                            "In chat apps, \"at Paul\" also works. Turn it off to leave all of these unchanged.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.literalDictationFormattingEnabled },
-                                            set: { SettingsStore.shared.literalDictationFormattingEnabled = $0 }
-                                        ),
-                                        allowsDescriptionWrapping: true
-                                    )
-                                    Divider().opacity(0.2)
-
-                                    self.optionToggleRow(
-                                        title: "Space Between Dictations",
-                                        description: "Add spacing so consecutive dictations chain without manually pressing the spacebar.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.continuousDictationSpacingEnabled },
-                                            set: { SettingsStore.shared.continuousDictationSpacingEnabled = $0 }
-                                        )
-                                    )
-                                    Divider().opacity(0.2)
-
-                                    self.optionToggleRow(
-                                        title: "Smart Capitalization",
-                                        description: "Use text before the cursor to decide whether the next dictation should start capitalized or lowercase.",
-                                        isOn: Binding(
-                                            get: { SettingsStore.shared.contextAwareCapitalizationEnabled },
-                                            set: { SettingsStore.shared.contextAwareCapitalizationEnabled = $0 }
-                                        )
-                                    )
-                                    Divider().opacity(0.2)
-
-                                    self.optionToggleRow(
                                         title: "Skip Silent Recordings",
                                         description: "Avoid transcription when a recording up to four seconds contains only clear silence. Disabled by default to preserve quiet speech.",
                                         isOn: Binding(
@@ -1063,6 +1011,66 @@ struct SettingsView: View {
                                     .controlSize(.small)
                                 }
                             }
+                        }
+                    }
+                    .padding(16)
+                }
+
+                ThemedCard(style: .standard) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Label("Text Formatting", systemImage: "textformat")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+
+                        VStack(spacing: 16) {
+                            self.settingsToggleRow(
+                                title: "Lowercase First Letter",
+                                description: "Start each transcription with a lowercase letter.",
+                                isOn: Binding(
+                                    get: { self.settings.gaavLowercaseFirstLetterEnabled },
+                                    set: { self.settings.gaavLowercaseFirstLetterEnabled = $0 }
+                                )
+                            )
+                            Divider().opacity(0.2)
+
+                            self.settingsToggleRow(
+                                title: "Remove Trailing Period",
+                                description: "Drop a final period from transcriptions.",
+                                isOn: Binding(
+                                    get: { self.settings.gaavRemoveTrailingPeriodEnabled },
+                                    set: { self.settings.gaavRemoveTrailingPeriodEnabled = $0 }
+                                )
+                            )
+                            Divider().opacity(0.2)
+
+                            self.settingsToggleRow(
+                                title: "Slash Commands & @ Formatting",
+                                description: "Convert spoken slash commands and supported @ mentions into symbols.",
+                                isOn: Binding(
+                                    get: { self.settings.literalDictationFormattingEnabled },
+                                    set: { self.settings.literalDictationFormattingEnabled = $0 }
+                                )
+                            )
+                            Divider().opacity(0.2)
+
+                            self.settingsToggleRow(
+                                title: "Space Between Dictations",
+                                description: "Add spacing when consecutive dictations are joined.",
+                                isOn: Binding(
+                                    get: { self.settings.continuousDictationSpacingEnabled },
+                                    set: { self.settings.continuousDictationSpacingEnabled = $0 }
+                                )
+                            )
+                            Divider().opacity(0.2)
+
+                            self.settingsToggleRow(
+                                title: "Smart Capitalization",
+                                description: "Use text before the cursor to choose uppercase or lowercase.",
+                                isOn: Binding(
+                                    get: { self.settings.contextAwareCapitalizationEnabled },
+                                    set: { self.settings.contextAwareCapitalizationEnabled = $0 }
+                                )
+                            )
                         }
                     }
                     .padding(16)
@@ -1821,10 +1829,11 @@ struct SettingsView: View {
 
                 Spacer()
 
-                Toggle("", isOn: isOn)
+                Toggle(title, isOn: isOn)
                     .toggleStyle(.switch)
                     .tint(self.theme.palette.accent)
                     .labelsHidden()
+                    .accessibilityLabel(title)
             }
 
             if let footnote = footnote {
