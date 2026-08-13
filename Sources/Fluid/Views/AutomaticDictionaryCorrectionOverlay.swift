@@ -251,7 +251,9 @@ final class MicrophoneChangeOverlayController {
     private init() {}
 
     func show(_ notice: MicrophoneChangeNotice) {
-        guard Bundle.main.bundleIdentifier == "com.FluidApp.app" else { return }
+        guard Bundle.main.bundleIdentifier == "com.FluidApp.app",
+              SettingsStore.shared.showMicrophoneChangeAlerts
+        else { return }
         self.generation &+= 1
         let currentGeneration = self.generation
         self.dismissTask?.cancel()
@@ -263,6 +265,9 @@ final class MicrophoneChangeOverlayController {
             onSettings: { [weak self] in
                 self?.hide()
                 NotificationCenter.default.post(name: .openMicrophoneSettingsRequested, object: nil)
+            },
+            onDisable: { [weak self] in
+                self?.disableFutureAlerts()
             },
             onDismiss: { [weak self] in self?.hide() }
         )
@@ -293,6 +298,11 @@ final class MicrophoneChangeOverlayController {
             else { return }
             self.hide()
         }
+    }
+
+    func disableFutureAlerts() {
+        SettingsStore.shared.showMicrophoneChangeAlerts = false
+        self.hide()
     }
 
     func hide() {
@@ -386,10 +396,12 @@ private struct MicrophoneChangeOverlayView: View {
     let displayDuration: TimeInterval
     let startedAt: Date
     let onSettings: () -> Void
+    let onDisable: () -> Void
     let onDismiss: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isCloseHovered = false
+    @State private var isDisableHovered = false
     @State private var isSettingsHovered = false
 
     var body: some View {
@@ -435,6 +447,11 @@ private struct MicrophoneChangeOverlayView: View {
 
                 Spacer(minLength: 8)
 
+                Button("Do not show again", action: self.onDisable)
+                    .buttonStyle(TransientOverlaySettingsButtonStyle(isHovered: self.isDisableHovered))
+                    .onHover { self.isDisableHovered = $0 }
+                    .help("Turn off microphone change alerts")
+
                 Button("Settings", action: self.onSettings)
                     .buttonStyle(TransientOverlaySettingsButtonStyle(isHovered: self.isSettingsHovered))
                     .onHover { self.isSettingsHovered = $0 }
@@ -443,7 +460,7 @@ private struct MicrophoneChangeOverlayView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .frame(width: 460)
+        .frame(width: 540)
         .background(TransientOverlayBackground())
         .overlay(alignment: .bottomLeading) {
             TransientOverlayCountdownBar(

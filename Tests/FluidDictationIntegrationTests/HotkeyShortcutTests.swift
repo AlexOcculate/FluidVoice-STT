@@ -15,6 +15,7 @@ final class HotkeyShortcutTests: XCTestCase {
     private let microphonePriorityKey = "MicrophonePriority"
     private let suppressedMicrophoneUIDsKey = "SuppressedMicrophoneUIDs"
     private let microphoneSelectionMigrationVersionKey = "AppOnlyMicrophoneSelectionMigrationVersion"
+    private let showMicrophoneChangeAlertsKey = "ShowMicrophoneChangeAlerts"
     private let experimentalDirectAudioCaptureEnabledKey = "ExperimentalDirectAudioCaptureEnabled"
 
     @MainActor
@@ -1143,6 +1144,29 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
+    func testDisablingMicrophoneChangeAlertsPreservesMicrophonePriority() throws {
+        try self.withRestoredDefaults(keys: [
+            self.microphonePriorityKey,
+            self.showMicrophoneChangeAlertsKey,
+        ]) {
+            let defaults = UserDefaults.standard
+            defaults.removeObject(forKey: self.showMicrophoneChangeAlertsKey)
+            let microphone = Self.device(uid: "preferred", name: "Preferred")
+            SettingsStore.shared.microphonePriority = [
+                .init(uid: microphone.uid, name: microphone.name),
+            ]
+
+            XCTAssertTrue(SettingsStore.shared.showMicrophoneChangeAlerts)
+
+            MicrophoneChangeOverlayController.shared.disableFutureAlerts()
+
+            XCTAssertFalse(SettingsStore.shared.showMicrophoneChangeAlerts)
+            XCTAssertEqual(SettingsStore.shared.makeBackupPayload().showMicrophoneChangeAlerts, false)
+            XCTAssertEqual(SettingsStore.shared.microphonePriority.map(\.uid), [microphone.uid])
+        }
+    }
+
+    @MainActor
     func testFailedPriorityDeviceAdvancesWithoutChangingSavedOrder() throws {
         try self.withRestoredDefaults(keys: [
             self.microphoneSelectionModeKey,
@@ -1305,6 +1329,37 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testClamshellKeepsBuiltInTransportExternalMicrophoneAvailable() throws {
+        try self.withRestoredDefaults(keys: [
+            self.microphoneSelectionModeKey,
+            self.preferredInputDeviceUIDKey,
+            self.microphonePriorityKey,
+            self.microphoneSelectionMigrationVersionKey,
+        ]) {
+            let wiredHeadset = Self.device(
+                uid: "wired-headset",
+                name: "External Microphone",
+                transportType: kAudioDeviceTransportTypeBuiltIn,
+                inputDataSourceID: AudioDevice.Device.externalMicrophoneDataSourceID
+            )
+            SettingsStore.shared.microphonePriority = [
+                .init(uid: wiredHeadset.uid, name: wiredHeadset.name),
+            ]
+            SettingsStore.shared.microphoneSelectionMode = .manual
+            SettingsStore.shared.microphoneSelectionMigrationVersion = 4
+            let devices = FakeAudioDeviceManager(
+                inputs: [wiredHeadset],
+                defaultInputUID: wiredHeadset.uid,
+                isClamshellClosed: true
+            )
+            let coordinator = MicrophonePreferenceCoordinator(settings: .shared, devices: devices)
+
+            XCTAssertTrue(wiredHeadset.isBuiltIn)
+            XCTAssertEqual(coordinator.inputDeviceForCapture(), wiredHeadset)
+        }
+    }
+
     func testNewMicrophoneEntersSecondAndStaysAfterDisconnecting() throws {
         try self.withRestoredDefaults(keys: [
             self.preferredInputDeviceUIDKey,
@@ -1396,7 +1451,8 @@ final class HotkeyShortcutTests: XCTestCase {
     private static func device(
         uid: String,
         name: String,
-        transportType: UInt32 = kAudioDeviceTransportTypeUnknown
+        transportType: UInt32 = kAudioDeviceTransportTypeUnknown,
+        inputDataSourceID: UInt32? = nil
     ) -> AudioDevice.Device {
         AudioDevice.Device(
             id: AudioObjectID(abs(uid.hashValue % 100_000) + 1),
@@ -1404,7 +1460,8 @@ final class HotkeyShortcutTests: XCTestCase {
             name: name,
             hasInput: true,
             hasOutput: false,
-            transportType: transportType
+            transportType: transportType,
+            inputDataSourceID: inputDataSourceID
         )
     }
 

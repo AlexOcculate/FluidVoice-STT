@@ -15,12 +15,15 @@ import IOKit.pwr_mgt
 
 nonisolated enum AudioDevice {
     struct Device: Identifiable, Hashable {
+        static let externalMicrophoneDataSourceID: UInt32 = 0x656d6963 // 'emic'
+
         let id: AudioObjectID
         let uid: String
         let name: String
         let hasInput: Bool
         let hasOutput: Bool
         let transportType: UInt32
+        let inputDataSourceID: UInt32?
         let isAlive: Bool
 
         init(
@@ -30,6 +33,7 @@ nonisolated enum AudioDevice {
             hasInput: Bool,
             hasOutput: Bool,
             transportType: UInt32 = kAudioDeviceTransportTypeUnknown,
+            inputDataSourceID: UInt32? = nil,
             isAlive: Bool = true
         ) {
             self.id = id
@@ -38,6 +42,7 @@ nonisolated enum AudioDevice {
             self.hasInput = hasInput
             self.hasOutput = hasOutput
             self.transportType = transportType
+            self.inputDataSourceID = inputDataSourceID
             self.isAlive = isAlive
         }
 
@@ -48,6 +53,12 @@ nonisolated enum AudioDevice {
 
         var isBuiltIn: Bool {
             self.transportType == kAudioDeviceTransportTypeBuiltIn
+        }
+
+        /// Analog headsets use the Mac's built-in audio transport, but Core Audio
+        /// identifies their selected input source as an external microphone.
+        var isUnavailableWhenClamshellClosed: Bool {
+            self.isBuiltIn && self.inputDataSourceID != Self.externalMicrophoneDataSourceID
         }
     }
 
@@ -134,6 +145,11 @@ nonisolated enum AudioDevice {
                 selector: kAudioDevicePropertyTransportType,
                 scope: kAudioObjectPropertyScopeGlobal
             ) ?? kAudioDeviceTransportTypeUnknown
+            let inputDataSourceID = hasIn ? self.getUInt32Property(
+                devId,
+                selector: kAudioDevicePropertyDataSource,
+                scope: kAudioObjectPropertyScopeInput
+            ) : nil
             devices.append(
                 Device(
                     id: devId,
@@ -142,6 +158,7 @@ nonisolated enum AudioDevice {
                     hasInput: hasIn,
                     hasOutput: hasOut,
                     transportType: transportType,
+                    inputDataSourceID: inputDataSourceID,
                     isAlive: cachedInputLiveness[
                         InputLivenessKey(id: devId, uid: uid)
                     ] ?? true
@@ -177,6 +194,7 @@ nonisolated enum AudioDevice {
                 hasInput: device.hasInput,
                 hasOutput: device.hasOutput,
                 transportType: device.transportType,
+                inputDataSourceID: device.inputDataSourceID,
                 isAlive: liveness[InputLivenessKey(id: device.id, uid: device.uid)] ?? true
             )
         }
@@ -251,7 +269,8 @@ nonisolated enum AudioDevice {
     /// alive while a MacBook is closed. Treat it as unavailable in that state,
     /// while leaving external and virtual inputs eligible.
     static func isInputDeviceUsable(_ device: Device) -> Bool {
-        self.isInputDeviceAlive(device) && (device.isBuiltIn == false || ClamshellState.isClosed == false)
+        self.isInputDeviceAlive(device) &&
+            (device.isUnavailableWhenClamshellClosed == false || ClamshellState.isClosed == false)
     }
 
     /// Get output device by UID without affecting system settings

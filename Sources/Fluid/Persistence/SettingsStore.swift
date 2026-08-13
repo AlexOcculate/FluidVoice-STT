@@ -3143,6 +3143,18 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Whether transient microphone selection and availability alerts are shown.
+    var showMicrophoneChangeAlerts: Bool {
+        get {
+            let value = self.defaults.object(forKey: Keys.showMicrophoneChangeAlerts)
+            return value as? Bool ?? true
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.showMicrophoneChangeAlerts)
+        }
+    }
+
     func makeBackupPayload() -> SettingsBackupPayload {
         SettingsBackupPayload(
             selectedProviderID: self.selectedProviderID,
@@ -3212,6 +3224,7 @@ final class SettingsStore: ObservableObject {
             saveAudioWithTranscriptionHistory: self.saveAudioWithTranscriptionHistory,
             audioHistoryBudgetGB: self.audioHistoryBudgetGB,
             notifyAIProcessingFailures: self.notifyAIProcessingFailures,
+            showMicrophoneChangeAlerts: self.showMicrophoneChangeAlerts,
             weekendsDontBreakStreak: self.weekendsDontBreakStreak,
             fillerWords: self.fillerWords,
             removeFillerWordsEnabled: self.removeFillerWordsEnabled,
@@ -3219,6 +3232,7 @@ final class SettingsStore: ObservableObject {
             literalDictationFormattingEnabled: self.literalDictationFormattingEnabled,
             punctuationDictionaryPrefix: self.punctuationDictionaryPrefix,
             punctuationDictionaryRules: self.punctuationDictionaryRules,
+            spokenFormattingActionRules: self.spokenFormattingActionRules,
             gaavModeEnabled: self.gaavModeEnabled,
             gaavLowercaseFirstLetterEnabled: self.gaavLowercaseFirstLetterEnabled,
             gaavRemoveTrailingPeriodEnabled: self.gaavRemoveTrailingPeriodEnabled,
@@ -3351,6 +3365,9 @@ final class SettingsStore: ObservableObject {
         if let notifyAIProcessingFailures = payload.notifyAIProcessingFailures {
             self.notifyAIProcessingFailures = notifyAIProcessingFailures
         }
+        if let showMicrophoneChangeAlerts = payload.showMicrophoneChangeAlerts {
+            self.showMicrophoneChangeAlerts = showMicrophoneChangeAlerts
+        }
         self.weekendsDontBreakStreak = payload.weekendsDontBreakStreak
         self.fillerWords = payload.fillerWords
         self.removeFillerWordsEnabled = payload.removeFillerWordsEnabled
@@ -3365,6 +3382,9 @@ final class SettingsStore: ObservableObject {
         }
         if let punctuationDictionaryRules = payload.punctuationDictionaryRules {
             self.punctuationDictionaryRules = punctuationDictionaryRules
+        }
+        if let spokenFormattingActionRules = payload.spokenFormattingActionRules {
+            self.spokenFormattingActionRules = spokenFormattingActionRules
         }
         let restoredGaavModeEnabled = payload.gaavModeEnabled
         let restoredContinuousDictationModeEnabled = payload.continuousDictationModeEnabled ?? false
@@ -3992,6 +4012,63 @@ final class SettingsStore: ObservableObject {
 
     static let defaultPunctuationDictionaryPrefix = "literal"
 
+    enum SpokenFormattingAction: String, Codable, CaseIterable, Identifiable {
+        case newLine
+        case newParagraph
+        case tab
+        case space
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .newLine: return "New Line"
+            case .newParagraph: return "New Paragraph"
+            case .tab: return "Tab"
+            case .space: return "Space"
+            }
+        }
+
+        var displaySymbol: String {
+            switch self {
+            case .newLine: return "⏎"
+            case .newParagraph: return "¶"
+            case .tab: return "⇥"
+            case .space: return "␣"
+            }
+        }
+
+        var output: String {
+            switch self {
+            case .newLine: return "\n"
+            case .newParagraph: return "\n\n"
+            case .tab: return "\t"
+            case .space: return " "
+            }
+        }
+    }
+
+    struct SpokenFormattingActionRule: Codable, Identifiable, Hashable {
+        var action: SpokenFormattingAction
+        var aliases: [String]
+        var isEnabled: Bool
+
+        var id: SpokenFormattingAction { self.action }
+
+        init(action: SpokenFormattingAction, aliases: [String], isEnabled: Bool = true) {
+            self.action = action
+            self.aliases = PunctuationDictionaryRule.normalizedAliases(aliases)
+            self.isEnabled = isEnabled && !self.aliases.isEmpty
+        }
+    }
+
+    static let defaultSpokenFormattingActionRules: [SpokenFormattingActionRule] = [
+        SpokenFormattingActionRule(action: .newLine, aliases: ["new line", "next line"]),
+        SpokenFormattingActionRule(action: .newParagraph, aliases: ["new paragraph", "next paragraph"]),
+        SpokenFormattingActionRule(action: .tab, aliases: ["tab"]),
+        SpokenFormattingActionRule(action: .space, aliases: ["space"]),
+    ]
+
     static let defaultPunctuationDictionaryRules: [PunctuationDictionaryRule] = [
         PunctuationDictionaryRule(aliases: ["comma"], symbol: ","),
         PunctuationDictionaryRule(aliases: ["period", "full stop"], symbol: "."),
@@ -4146,6 +4223,68 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    var spokenFormattingActionRules: [SpokenFormattingActionRule] {
+        get {
+            guard let data = defaults.data(forKey: Keys.spokenFormattingActionRules),
+                  let decoded = try? JSONDecoder().decode([SpokenFormattingActionRule].self, from: data)
+            else {
+                return Self.defaultSpokenFormattingActionRules
+            }
+
+            var rulesByAction: [SpokenFormattingAction: SpokenFormattingActionRule] = [:]
+            for rule in decoded where rulesByAction[rule.action] == nil {
+                rulesByAction[rule.action] = rule
+            }
+            let orderedRules = SpokenFormattingAction.allCases.map { action in
+                guard let rule = rulesByAction[action] else {
+                    return Self.defaultSpokenFormattingActionRules.first { $0.action == action }
+                        ?? SpokenFormattingActionRule(action: action, aliases: [], isEnabled: false)
+                }
+                return SpokenFormattingActionRule(
+                    action: action,
+                    aliases: rule.aliases,
+                    isEnabled: rule.isEnabled
+                )
+            }
+            return self.removingDuplicateSpokenFormattingAliases(from: orderedRules)
+        }
+        set {
+            objectWillChange.send()
+            var rulesByAction: [SpokenFormattingAction: SpokenFormattingActionRule] = [:]
+            for rule in newValue where rulesByAction[rule.action] == nil {
+                rulesByAction[rule.action] = rule
+            }
+            let orderedRules = SpokenFormattingAction.allCases.map { action in
+                guard let rule = rulesByAction[action] else {
+                    return SpokenFormattingActionRule(action: action, aliases: [], isEnabled: false)
+                }
+                return SpokenFormattingActionRule(
+                    action: action,
+                    aliases: rule.aliases,
+                    isEnabled: rule.isEnabled
+                )
+            }
+            let normalizedRules = self.removingDuplicateSpokenFormattingAliases(from: orderedRules)
+            if let encoded = try? JSONEncoder().encode(normalizedRules) {
+                self.defaults.set(encoded, forKey: Keys.spokenFormattingActionRules)
+            }
+        }
+    }
+
+    private func removingDuplicateSpokenFormattingAliases(
+        from rules: [SpokenFormattingActionRule]
+    ) -> [SpokenFormattingActionRule] {
+        var claimedAliases = Set(self.punctuationDictionaryRules.flatMap(\.aliases))
+        return rules.map { rule in
+            let uniqueAliases = rule.aliases.filter { claimedAliases.insert($0).inserted }
+            return SpokenFormattingActionRule(
+                action: rule.action,
+                aliases: uniqueAliases,
+                isEnabled: rule.isEnabled
+            )
+        }
+    }
+
     // MARK: - GAAV Mode
 
     /// Legacy combined GAAV setting. New behavior uses the split formatting toggles below.
@@ -4245,6 +4384,13 @@ final class SettingsStore: ObservableObject {
             self.id = id
             self.triggers = triggers.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
             self.replacement = replacement
+        }
+
+        /// Trims padding around visible replacement text while preserving an intentional
+        /// all-whitespace payload such as a newline, space, or tab.
+        static func sanitizedReplacement(_ text: String) -> String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? text : trimmed
         }
     }
 
@@ -5078,6 +5224,7 @@ private extension SettingsStore {
         static let microphoneSelectionMode = "MicrophoneSelectionMode"
         // Keep the original persisted key so existing installs migrate in place.
         static let microphoneSelectionMigrationVersion = "AppOnlyMicrophoneSelectionMigrationVersion"
+        static let showMicrophoneChangeAlerts = "ShowMicrophoneChangeAlerts"
         static let visualizerNoiseThreshold = "VisualizerNoiseThreshold"
         static let launchAtStartup = "LaunchAtStartup"
         static let showInDock = "ShowInDock"
@@ -5155,6 +5302,7 @@ private extension SettingsStore {
         static let literalDictationFormattingEnabled = "LiteralDictationFormattingEnabled"
         static let punctuationDictionaryPrefix = "PunctuationDictionaryPrefix"
         static let punctuationDictionaryRules = "PunctuationDictionaryRules"
+        static let spokenFormattingActionRules = "SpokenFormattingActionRules"
 
         /// GAAV Mode (removes capitalization and trailing punctuation)
         static let gaavModeEnabled = "GAAVModeEnabled"

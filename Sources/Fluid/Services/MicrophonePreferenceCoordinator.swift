@@ -414,7 +414,7 @@ final class MicrophonePreferenceCoordinator: ObservableObject {
         clamshellClosed: Bool
     ) -> Bool {
         guard self.settings.suppressedMicrophoneUIDs.contains(device.uid) == false else { return false }
-        guard clamshellClosed == false || device.isBuiltIn == false else { return false }
+        guard clamshellClosed == false || device.isUnavailableWhenClamshellClosed == false else { return false }
         return self.devices.isInputDeviceUsable(device)
     }
 }

@@ -1388,11 +1388,6 @@ final class ASRService: ObservableObject {
             availableInputs: initialInputSnapshot.0,
             defaultInputUID: initialInputSnapshot.1
         )
-        microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
-            microphoneAuthorized: self.micStatus == .authorized,
-            launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
-                .shouldPresentStartupMicrophoneNotice ?? true
-        )
 
         self.registerDefaultDeviceChangeListener()
         self.registerEngineConfigurationChangeObserver()
@@ -1495,11 +1490,6 @@ final class ASRService: ObservableObject {
                     self.micPermissionGranted = granted
                     self.micStatus = granted ? .authorized : .denied
                     if granted {
-                        AppServices.shared.microphonePreferenceCoordinator.scheduleStartupNoticeIfEligible(
-                            microphoneAuthorized: true,
-                            launchAllowsPresentation: (NSApp.delegate as? AppDelegate)?
-                                .shouldPresentStartupMicrophoneNotice ?? true
-                        )
                         await self.prewarmConfiguredAudioCaptureIfPossible(reason: "permission_granted")
                     }
                 }
@@ -4586,7 +4576,12 @@ final class ASRService: ObservableObject {
             for trigger in entry.triggers {
                 guard !trigger.isEmpty else { continue }
 
-                let escapedTrigger = self.dictionaryPattern(for: trigger)
+                let consumesHorizontalSeparators = !entry.replacement.isEmpty &&
+                    entry.replacement.allSatisfy(\.isWhitespace)
+                let escapedTrigger = self.dictionaryPattern(
+                    for: trigger,
+                    consumesHorizontalSeparators: consumesHorizontalSeparators
+                )
                 guard let regex = try? NSRegularExpression(
                     pattern: escapedTrigger,
                     options: .caseInsensitive
@@ -4602,11 +4597,15 @@ final class ASRService: ObservableObject {
         self.dictionaryCacheNeedsRebuild = false
     }
 
-    private static func dictionaryPattern(for trigger: String) -> String {
+    private static func dictionaryPattern(
+        for trigger: String,
+        consumesHorizontalSeparators: Bool = false
+    ) -> String {
         let escapedTrigger = NSRegularExpression.escapedPattern(for: trigger)
         let prefix = self.startsWithWordCharacter(trigger) ? "\\b" : ""
         let suffix = self.endsWithWordCharacter(trigger) ? "\\b" : ""
-        return prefix + escapedTrigger + suffix
+        let separator = consumesHorizontalSeparators ? "[ \\t]*" : ""
+        return separator + prefix + escapedTrigger + suffix + separator
     }
 
     private static func startsWithWordCharacter(_ text: String) -> Bool {
