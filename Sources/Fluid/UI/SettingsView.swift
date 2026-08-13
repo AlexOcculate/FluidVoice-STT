@@ -940,7 +940,7 @@ struct SettingsView: View {
 
                                     self.optionToggleRow(
                                         title: "Share Anonymous Analytics",
-                                        description: "Send anonymous usage and performance metrics to help improve FluidVoice. Never includes transcription text or prompts.",
+                                        description: "Send lean, anonymous daily usage, onboarding, retention, and model metrics. Never includes transcription text or prompts.",
                                         isOn: self.analyticsToggleBinding
                                     )
 
@@ -1804,7 +1804,6 @@ struct SettingsView: View {
     private func applyAnalyticsConsentChange(_ enabled: Bool) {
         SettingsStore.shared.shareAnonymousAnalytics = enabled
         AnalyticsService.shared.setEnabled(enabled)
-        AnalyticsService.shared.capture(.analyticsConsentChanged, properties: ["enabled": enabled])
     }
 
     // MARK: - Helper Views

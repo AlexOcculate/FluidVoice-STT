@@ -271,6 +271,7 @@ final class ASRService: ObservableObject {
     private var ensureReadyOperationID: UUID?
     private var modelDownloadTask: Task<Void, Error>?
     private var modelDownloadOperationID: UUID?
+    private var modelDownloadAnalyticsStates: [UUID: ModelDownloadAnalyticsState] = [:]
     private var modelExistenceCheckID: UUID?
 
     var hasActiveModelPreparation: Bool {
@@ -473,77 +474,6 @@ final class ASRService: ObservableObject {
         DebugLogger.shared.benchmark("ASR_BENCH", message: "session=\(self.benchmarkSessionID) \(message)", source: "ASRBenchmark")
     }
 
-    private func streamingChunkErrorCategory(for error: Error) -> String {
-        if error is CancellationError {
-            return "cancelled"
-        }
-
-        let nsError = error as NSError
-        switch nsError.domain {
-        case AVFoundationErrorDomain:
-            return "avfoundation"
-        case NSOSStatusErrorDomain:
-            return "osstatus"
-        case NSCocoaErrorDomain:
-            return "cocoa"
-        default:
-            return "other"
-        }
-    }
-
-    private func shouldCaptureStreamingChunkAnalytics(success: Bool) -> Bool {
-        if success {
-            self.streamingChunkAnalyticsSuccessCount += 1
-            if self.streamingChunkAnalyticsSuccessCount == 1 {
-                return true
-            }
-            return self.streamingChunkAnalyticsSuccessCount % self.streamingChunkAnalyticsSuccessSampleRate == 0
-        }
-
-        let now = Date()
-        guard let lastFailureCaptureAt = self.lastStreamingChunkFailureAnalyticsAt else {
-            self.lastStreamingChunkFailureAnalyticsAt = now
-            return true
-        }
-
-        guard now.timeIntervalSince(lastFailureCaptureAt) >= self.streamingChunkFailureMinIntervalSeconds else {
-            return false
-        }
-
-        self.lastStreamingChunkFailureAnalyticsAt = now
-        return true
-    }
-
-    private func captureStreamingChunkAnalytics(
-        success: Bool,
-        chunkSampleCount: Int,
-        latencyMs: Int,
-        error: Error? = nil
-    ) {
-        guard self.shouldCaptureStreamingChunkAnalytics(success: success) else { return }
-
-        let dims = self.currentTranscriptionAnalyticsDimensions()
-        var properties: [String: Any] = [
-            "success": success,
-            "latency_ms": latencyMs,
-            "chunk_samples": chunkSampleCount,
-            "chunk_audio_seconds": Double(chunkSampleCount) / 16_000.0,
-            "transcription_provider": dims.provider,
-            "transcription_model": dims.model,
-            "success_sample_rate_chunks": self.streamingChunkAnalyticsSuccessSampleRate,
-            "failure_min_interval_seconds": self.streamingChunkFailureMinIntervalSeconds,
-        ]
-
-        if let error {
-            properties["error_category"] = self.streamingChunkErrorCategory(for: error)
-        }
-
-        AnalyticsService.shared.capture(
-            .transcriptionChunkProcessed,
-            properties: properties
-        )
-    }
-
     /// Gets a provider for a specific model (without changing the active selection)
     /// Used for downloading models without switching the active model.
     private func getProvider(for model: SettingsStore.SpeechModel) -> TranscriptionProvider {
@@ -578,7 +508,11 @@ final class ASRService: ObservableObject {
     /// - Parameters:
     ///   - model: The model to download
     ///   - progressHandler: Optional callback for download progress (0.0 to 1.0)
-    func downloadModel(_ model: SettingsStore.SpeechModel, progressHandler: ((Double) -> Void)?) async throws {
+    func downloadModel(
+        _ model: SettingsStore.SpeechModel,
+        source: AnalyticsModelDownloadSource = .settings,
+        progressHandler: ((Double) -> Void)?
+    ) async throws {
         guard self.modelDownloadTask == nil, self.ensureReadyTask == nil else {
             throw NSError(
                 domain: "ASRService",
@@ -610,7 +544,10 @@ final class ASRService: ObservableObject {
                         self.applyModelPreparationProgress(
                             progress,
                             updatesActiveModelState: false,
-                            externalProgressHandler: progressHandler
+                            externalProgressHandler: progressHandler,
+                            analyticsOperationID: operationID,
+                            analyticsDescriptor: model.analyticsDescriptor,
+                            analyticsSource: source
                         )
                     }
                 })
@@ -643,10 +580,19 @@ final class ASRService: ObservableObject {
             }
         }
 
-        try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        do {
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            self.finishModelDownloadAnalytics(operationID: operationID, outcome: .succeeded)
+        } catch is CancellationError {
+            self.finishModelDownloadAnalytics(operationID: operationID, outcome: .cancelled)
+            throw CancellationError()
+        } catch {
+            self.finishModelDownloadAnalytics(operationID: operationID, outcome: .failed)
+            throw error
         }
     }
 
@@ -1111,10 +1057,6 @@ final class ASRService: ObservableObject {
     private var benchmarkStreamingChunkIndex: Int = 0
     private var benchmarkCompletedStreamingChunks: Int = 0
     private var benchmarkLastChunkSampleCount: Int = 0
-    private let streamingChunkAnalyticsSuccessSampleRate: Int = 50
-    private let streamingChunkFailureMinIntervalSeconds: TimeInterval = 15
-    private var streamingChunkAnalyticsSuccessCount: Int = 0
-    private var lastStreamingChunkFailureAnalyticsAt: Date?
     private let transcriptionExecutor = TranscriptionExecutor() // Serializes all CoreML access
     private var providerResetDrain: (id: UUID, task: Task<Void, Never>)?
     private var engineConfigurationChangeObserver: NSObjectProtocol?
@@ -1754,8 +1696,6 @@ final class ASRService: ObservableObject {
         self.benchmarkStreamingChunkIndex = 0
         self.benchmarkCompletedStreamingChunks = 0
         self.benchmarkLastChunkSampleCount = 0
-        self.streamingChunkAnalyticsSuccessCount = 0
-        self.lastStreamingChunkFailureAnalyticsAt = nil
         (self.transcriptionProvider as? FluidAudioProvider)?.resetStreamingPreviewCache()
         self.audioCapturePipeline.setRecordingEnabled(
             true,
@@ -2218,8 +2158,6 @@ final class ASRService: ObservableObject {
         self.isProcessingChunk = false
         self.skipNextChunk = false
         self.previousFullTranscription.removeAll()
-        self.streamingChunkAnalyticsSuccessCount = 0
-        self.lastStreamingChunkFailureAnalyticsAt = nil
 
         // NOW it's safe to access the buffer - all pending tasks have completed
         // Thread-safe copy of recorded audio
@@ -2561,8 +2499,6 @@ final class ASRService: ObservableObject {
         self.lastProcessedSampleCount = 0
         self.isProcessingChunk = false
         self.skipNextChunk = false
-        self.streamingChunkAnalyticsSuccessCount = 0
-        self.lastStreamingChunkFailureAnalyticsAt = nil
         self.refreshWordBoostStatus()
 
         // Resume media playback if we paused it
@@ -3850,10 +3786,17 @@ final class ASRService: ObservableObject {
     // Audio tap processing is handled by AudioCapturePipeline (thread-safe).
 
     func ensureAsrReady() async throws {
-        try await self.ensureAsrReady(progressHandler: nil)
+        try await self.ensureAsrReady(source: .automatic, progressHandler: nil)
     }
 
     func ensureAsrReady(progressHandler: ((Double) -> Void)?) async throws {
+        try await self.ensureAsrReady(source: .automatic, progressHandler: progressHandler)
+    }
+
+    func ensureAsrReady(
+        source: AnalyticsModelDownloadSource,
+        progressHandler: ((Double) -> Void)? = nil
+    ) async throws {
         guard self.modelDownloadTask == nil else {
             throw NSError(
                 domain: "ASRService",
@@ -3907,6 +3850,7 @@ final class ASRService: ObservableObject {
             try await self.performEnsureAsrReady(
                 provider: provider,
                 operationID: operationID,
+                analyticsSource: source,
                 externalProgressHandler: progressHandler
             )
         }
@@ -3938,6 +3882,7 @@ final class ASRService: ObservableObject {
     private func performEnsureAsrReady(
         provider: TranscriptionProvider,
         operationID: UUID,
+        analyticsSource: AnalyticsModelDownloadSource,
         externalProgressHandler: ((Double) -> Void)? = nil
     ) async throws {
         guard self.ensureReadyOperationID == operationID else { throw CancellationError() }
@@ -4028,7 +3973,10 @@ final class ASRService: ObservableObject {
                         self.applyModelPreparationProgress(
                             progress,
                             updatesActiveModelState: true,
-                            externalProgressHandler: externalProgressHandler
+                            externalProgressHandler: externalProgressHandler,
+                            analyticsOperationID: operationID,
+                            analyticsDescriptor: SettingsStore.shared.selectedSpeechModel.analyticsDescriptor,
+                            analyticsSource: analyticsSource
                         )
                     }
                 }
@@ -4058,7 +4006,9 @@ final class ASRService: ObservableObject {
             self.isAsrReady = true
             self.isCancellingModelPreparation = false
             self.refreshWordBoostStatus()
+            self.finishModelDownloadAnalytics(operationID: operationID, outcome: .succeeded)
         } catch is CancellationError {
+            self.finishModelDownloadAnalytics(operationID: operationID, outcome: .cancelled)
             DebugLogger.shared.info("ASR initialization cancelled", source: "ASRService")
             if provider.shouldClearCacheAfterCancellation,
                provider.modelsExistOnDisk() == false
@@ -4083,6 +4033,7 @@ final class ASRService: ObservableObject {
             throw CancellationError()
         } catch {
             if Task.isCancelled || Self.isModelPreparationCancellation(error) {
+                self.finishModelDownloadAnalytics(operationID: operationID, outcome: .cancelled)
                 if provider.shouldClearCacheAfterCancellation,
                    provider.modelsExistOnDisk() == false
                 {
@@ -4098,6 +4049,7 @@ final class ASRService: ObservableObject {
                 }
                 throw CancellationError()
             }
+            self.finishModelDownloadAnalytics(operationID: operationID, outcome: .failed)
             DebugLogger.shared.error("ASR initialization failed with error: \(error)", source: "ASRService")
             DebugLogger.shared.error("Error details: \(error.localizedDescription)", source: "ASRService")
             if self.ensureReadyOperationID == operationID {
@@ -4113,7 +4065,10 @@ final class ASRService: ObservableObject {
     private func applyModelPreparationProgress(
         _ progress: ModelPreparationProgress,
         updatesActiveModelState: Bool,
-        externalProgressHandler: ((Double) -> Void)?
+        externalProgressHandler: ((Double) -> Void)?,
+        analyticsOperationID: UUID? = nil,
+        analyticsDescriptor: AnalyticsModelDescriptor? = nil,
+        analyticsSource: AnalyticsModelDownloadSource = .automatic
     ) {
         switch progress.phase {
         case .preparingDownload:
@@ -4123,6 +4078,13 @@ final class ASRService: ObservableObject {
                 self.isLoadingModel = false
             }
         case .downloading:
+            if let analyticsOperationID, let analyticsDescriptor {
+                self.beginModelDownloadAnalytics(
+                    operationID: analyticsOperationID,
+                    descriptor: analyticsDescriptor,
+                    source: analyticsSource
+                )
+            }
             self.downloadProgress = progress.fractionCompleted
             if updatesActiveModelState {
                 self.isDownloadingModel = true
@@ -4132,12 +4094,18 @@ final class ASRService: ObservableObject {
                 externalProgressHandler?(fraction)
             }
         case .optimizing:
+            if let analyticsOperationID {
+                self.finishModelDownloadAnalytics(operationID: analyticsOperationID, outcome: .succeeded)
+            }
             self.downloadProgress = nil
             if updatesActiveModelState {
                 self.isDownloadingModel = true
                 self.isLoadingModel = false
             }
         case .loading:
+            if let analyticsOperationID {
+                self.finishModelDownloadAnalytics(operationID: analyticsOperationID, outcome: .succeeded)
+            }
             self.downloadProgress = nil
             if updatesActiveModelState {
                 self.isDownloadingModel = false
@@ -4146,6 +4114,44 @@ final class ASRService: ObservableObject {
         }
 
         self.modelPreparationPhase = progress.phase
+    }
+
+    private struct ModelDownloadAnalyticsState {
+        let descriptor: AnalyticsModelDescriptor
+        let source: AnalyticsModelDownloadSource
+        let startedAt: Date
+    }
+
+    private func beginModelDownloadAnalytics(
+        operationID: UUID,
+        descriptor: AnalyticsModelDescriptor,
+        source: AnalyticsModelDownloadSource
+    ) {
+        guard self.modelDownloadAnalyticsStates[operationID] == nil else { return }
+        self.modelDownloadAnalyticsStates[operationID] = ModelDownloadAnalyticsState(
+            descriptor: descriptor,
+            source: source,
+            startedAt: Date()
+        )
+        AnalyticsService.shared.recordModelDownloadStarted(
+            id: operationID,
+            descriptor: descriptor,
+            source: source
+        )
+    }
+
+    private func finishModelDownloadAnalytics(
+        operationID: UUID,
+        outcome: AnalyticsModelDownloadOutcome
+    ) {
+        guard let state = self.modelDownloadAnalyticsStates.removeValue(forKey: operationID) else { return }
+        AnalyticsService.shared.recordModelDownloadFinished(
+            id: operationID,
+            descriptor: state.descriptor,
+            source: state.source,
+            outcome: outcome,
+            duration: Date().timeIntervalSince(state.startedAt)
+        )
     }
 
     private func prepareProviderWithRecovery(
@@ -4406,12 +4412,6 @@ final class ASRService: ObservableObject {
             }
 
             let duration = Date().timeIntervalSince(startTime)
-            let latencyMs = Int((duration * 1000).rounded())
-            self.captureStreamingChunkAnalytics(
-                success: true,
-                chunkSampleCount: chunk.count,
-                latencyMs: latencyMs
-            )
             DebugLogger.shared.debug(
                 "Streaming chunk transcription finished in \(String(format: "%.2f", duration))s",
                 source: "ASRService"
@@ -4459,14 +4459,6 @@ final class ASRService: ObservableObject {
                 self.skipNextChunk = true
             }
         } catch {
-            let duration = Date().timeIntervalSince(startTime)
-            let latencyMs = Int((duration * 1000).rounded())
-            self.captureStreamingChunkAnalytics(
-                success: false,
-                chunkSampleCount: chunk.count,
-                latencyMs: latencyMs,
-                error: error
-            )
             DebugLogger.shared.error("❌ Streaming failed: \(error)", source: "ASRService")
             self.benchmarkLog("chunk_fail index=\(chunkIndex) elapsedMs=\(self.elapsedMilliseconds(since: startedAt)) samples=\(chunk.count) error=\(error.localizedDescription)")
             self.skipNextChunk = true

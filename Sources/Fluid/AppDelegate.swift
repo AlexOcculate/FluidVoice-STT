@@ -17,6 +17,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var didRequestMainWindowReopen = false
     private var shouldSuppressNextReopenActivation = false
     private var wasLaunchedAsLoginItem = false
+    private var analyticsActivationSuppressionDeadline: Date?
     private var hasDeferredMLXUpgradeOffer = false
 
     var shouldPresentStartupMicrophoneNotice: Bool {
@@ -29,6 +30,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Must be read during the launch callback - the current Apple Event identifies
         // login-item launches (used to optionally start silently, see issue #369).
         self.wasLaunchedAsLoginItem = Self.detectLoginItemLaunch()
+        if self.wasLaunchedAsLoginItem {
+            self.analyticsActivationSuppressionDeadline = Date().addingTimeInterval(3)
+        }
         DebugLogger.shared.info(
             "Application launched [loginItemLaunch=\(self.wasLaunchedAsLoginItem)]",
             source: "AppDelegate"
@@ -46,14 +50,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         SettingsStore.shared.bootstrapOnboardingState(isTrueFirstOpen: isTrueFirstOpen)
 
         AnalyticsService.shared.bootstrap()
-
-        if isTrueFirstOpen {
-            AnalyticsService.shared.capture(.appFirstOpen)
-        }
-        AnalyticsService.shared.capture(
-            .appOpen,
-            properties: ["accessibility_trusted": AXIsProcessTrusted()]
-        )
 
         // Check for updates automatically if enabled (initial check on launch)
         self.checkForUpdatesAutomatically()
@@ -139,9 +135,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        guard self.hasDeferredMLXUpgradeOffer else { return }
-        self.hasDeferredMLXUpgradeOffer = false
-        self.scheduleMLXUpgradeOffer()
+        if let deadline = self.analyticsActivationSuppressionDeadline, Date() <= deadline {
+            self.analyticsActivationSuppressionDeadline = nil
+        } else {
+            self.analyticsActivationSuppressionDeadline = nil
+            AnalyticsService.shared.recordAppActivity()
+        }
+        if self.hasDeferredMLXUpgradeOffer {
+            self.hasDeferredMLXUpgradeOffer = false
+            self.scheduleMLXUpgradeOffer()
+        }
     }
 
     func userNotificationCenter(

@@ -2586,6 +2586,10 @@ final class SettingsStore: ObservableObject {
         !self.onboardingCompleted
     }
 
+    var analyticsOnboardingOrigin: AnalyticsOnboardingOrigin {
+        self.defaults.bool(forKey: Keys.manualOnboardingResetRequested) ? .manualRestart : .firstRun
+    }
+
     var shouldPromptAccessibilityOnLaunch: Bool {
         !self.shouldShowOnboarding
     }
@@ -3869,6 +3873,24 @@ final class SettingsStore: ObservableObject {
         }
 
         return ModelRepository.shared.defaultModels(for: providerID).first
+    }
+
+    func analyticsAIModelDescriptor(for mode: AnalyticsUsageMode) -> AnalyticsModelDescriptor? {
+        let providerID: String
+        let selectedModel: String?
+        switch mode {
+        case .edit:
+            providerID = self.rewriteModeLinkedToGlobal ? self.selectedProviderID : self.rewriteModeSelectedProviderID
+            selectedModel = self.rewriteModeLinkedToGlobal ? self.modelSelection(for: providerID) : self.rewriteModeSelectedModel
+        case .command:
+            providerID = self.commandModeLinkedToGlobal ? self.selectedProviderID : self.commandModeSelectedProviderID
+            selectedModel = self.commandModeLinkedToGlobal ? self.modelSelection(for: providerID) : self.commandModeSelectedModel
+        case .dictation, .meeting:
+            providerID = self.selectedProviderID
+            selectedModel = self.modelSelection(for: providerID)
+        }
+        guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return AnalyticsModelDescriptor(provider: providerID, model: selectedModel ?? "unknown")
     }
 
     private func availableSelectedProviderID(for rawValue: String?) -> String {
